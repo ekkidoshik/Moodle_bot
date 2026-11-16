@@ -2,7 +2,7 @@
 Телеграм-бот, который следит за курсами Moodle нескольких академических групп
 и присылает каждому подписчику уведомления только по курсам его группы.
 
-Один запуск = один проход (его делает GitHub Actions раз в ~15 минут):
+Один запуск = один проход (его делает GitHub Actions раз в CHECK_EVERY_MIN минут):
   1. забираем у Telegram накопившиеся сообщения (getUpdates): /start — показать
      клавиатуру с группами, нажатие кнопки группы или команда /<ключ> из меню —
      подписаться, /courses — список курсов с отключением ненужных,
@@ -42,6 +42,8 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MOODLE_URL = os.getenv("MOODLE_URL") or "https://on2026.econ.msu.ru"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 ADMIN_CHAT_ID = os.getenv("ADMIN_CHAT_ID", "").strip()
+# Как часто внешний cron-job запускает workflow — только для текстов бота
+CHECK_EVERY_MIN = int(os.getenv("CHECK_EVERY_MIN", "5"))
 RELAY_URL = os.getenv("RELAY_URL", "").strip().rstrip("/")
 BOT_SYNC_SECRET = os.getenv("BOT_SYNC_SECRET", "").strip()
 GROUPS_FILE = os.getenv("GROUPS_FILE", os.path.join(BASE_DIR, "groups.json"))
@@ -302,8 +304,19 @@ def read_raw_state():
         return json.load(f)
 
 
+def state_hash(state):
+    return hashlib.sha256(json.dumps(state, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+
+
+LOADED_STATE_HASH = None  # хэш состояния сразу после загрузки — чтобы не писать то же самое
+
+
 def flush_state(state):
-    """Сохраняет состояние в Worker. Возвращает размер в байтах (для отчёта)."""
+    """Сохраняет состояние в Worker, только если оно изменилось за запуск (лимит KV —
+    1000 записей в сутки). Возвращает размер в байтах или 0, если писать не пришлось."""
+    if state_hash(state) == LOADED_STATE_HASH:
+        log.info("Состояние не изменилось — в Worker не пишу")
+        return 0
     body = json.dumps(state, ensure_ascii=False).encode()
     r = requests.put(RELAY_URL + "/api/state", data=body, timeout=60,
                      headers={"Authorization": f"Bearer {BOT_SYNC_SECRET}",
@@ -350,7 +363,7 @@ def save_state(state):
 
 # ----------------------- Команды и кнопки ------------------------------
 #
-# Бот просыпается раз в ~15 минут, поэтому выбор группы сделан так, чтобы
+# Без Worker бот просыпается раз в CHECK_EVERY_MIN минут, поэтому выбор группы сделан так, чтобы
 # нажатие срабатывало сразу на стороне Telegram, без ответа бота:
 #   - меню команд (/m104, /e207, ...) видно ещё до /start — его ставит setMyCommands;
 #   - обычная (reply) клавиатура с названиями групп: нажатие сразу отправляет
@@ -373,14 +386,16 @@ def setup_bot_profile(groups, state):
         {"command": "stop", "description": "Отписаться от уведомлений"},
     ]
     description = (
-        "Присылаю новые и обновлённые файлы из курсов Moodle вашей группы "
-        "и напоминаю о дедлайнах за сутки и за 3 часа.\n\n"
-        "Нажмите «Начать», затем выберите группу на клавиатуре или в меню."
+        "Присылаю новые и обновлённые файлы из курсов Moodle вашей группы, напоминаю "
+        "о дедлайнах, ищу материалы по курсам и добавляю сроки в календарь.\n\n"
+        "Нажмите «Начать» и выберите группу на клавиатуре или в меню. "
     )
-    if not relay_enabled():
-        description += (" Бот проверяет сообщения примерно раз в 15 минут, поэтому "
+    if relay_enabled():
+        description += f"Бот отвечает сразу, а Moodle проверяет каждые {CHECK_EVERY_MIN} минут."
+    else:
+        description += (f"Бот читает сообщения раз в {CHECK_EVERY_MIN} минут, поэтому "
                         "подтверждение придёт не сразу — выбор при этом уже сохранён.")
-    short = "Новые файлы и дедлайны из Moodle вашей группы. Выберите группу в меню."
+    short = "Новые файлы, дедлайны и поиск по Moodle вашей группы. Выберите группу в меню."
 
     signature = json.dumps([commands, description, short], ensure_ascii=False, sort_keys=True)
     if state.get("bot_profile") == signature:
@@ -426,7 +441,7 @@ def subscribe(chat_id, key, groups, state):
         chat_id,
         f"✅ Группа <b>{html.escape(groups[key]['title'])}</b> выбрана.\n"
         "Буду присылать новые и обновлённые файлы из её курсов и напоминать "
-        "о дедлайнах (проверка примерно раз в 15 минут).\n\n"
+        f"о дедлайнах (проверка каждые {CHECK_EVERY_MIN} минут).\n\n"
         f"{BTN_COURSES} — список курсов, ненужные можно отключить.\n"
         "Сменить группу — кнопкой внизу, /stop — отписаться.",
         reply_markup=groups_keyboard(groups, key),
@@ -481,7 +496,7 @@ def courses_text(chat_id, key, groups, state):
     title = html.escape(groups[key]["title"])
     if not names:
         return (f"Курсы группы <b>{title}</b> появятся после ближайшей проверки Moodle "
-                "(до 15 минут). Тогда нажмите «Мои курсы» ещё раз.")
+                f"(до {CHECK_EVERY_MIN} минут). Тогда нажмите «Мои курсы» ещё раз.")
     lines = [f"📚 Курсы группы <b>{title}</b>:\n"]
     for cid, name in sorted(names.items(), key=lambda x: x[1]):
         if is_muted(state, chat_id, cid):
@@ -490,7 +505,7 @@ def courses_text(chat_id, key, groups, state):
             lines.append(f"🔔 {html.escape(name)}\n      отключить: /off_{cid}")
     lines.append("\nНажмите команду под курсом, чтобы отключить или включить по нему "
                  "уведомления о файлах и дедлайнах. Изменение применится при следующей "
-                 "проверке (до 15 минут).")
+                 f"проверке (до {CHECK_EVERY_MIN} минут).")
     return "\n".join(lines)
 
 
@@ -568,7 +583,7 @@ def handle_callback(cq, groups, state):
     key = RENAMED_GROUPS.get(key, key)
 
     try:
-        # кнопка нажата до 15 минут назад: Telegram может ответить «query is too old»
+        # кнопка могла быть нажата несколько минут назад: Telegram ответит «query is too old»
         tg("answerCallbackQuery", callback_query_id=cq["id"],
            text="Готово" if key in groups else "Выберите группу заново: /start")
     except TelegramError as e:
@@ -688,6 +703,7 @@ def push_to_relay(groups, state):
         "course_names": {k: state["course_names"].get(k, {}) for k in groups},
         "deadlines": {k: state["deadlines"].get(k, []) for k in groups},
         "admin": ADMIN_CHAT_ID,  # /stats и /broadcast в Worker — только этому чату
+        "check_every": CHECK_EVERY_MIN,
     }
     signature = hashlib.sha256(
         json.dumps(catalog, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -971,7 +987,7 @@ def check_moodle(groups, state):
             error = str(e)
             log.error("Группа %s: %s", key, error)
 
-        # админу пишем только при смене статуса, а не каждые 15 минут
+        # админу пишем только при смене статуса, а не на каждой проверке
         previous = state["group_errors"].get(key)
         if error != previous:
             title = html.escape(group["title"])
@@ -992,8 +1008,10 @@ def check_moodle(groups, state):
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise RuntimeError("Не задан секрет TELEGRAM_BOT_TOKEN")
+    global LOADED_STATE_HASH
     groups = load_groups()
     state = load_state(groups)
+    LOADED_STATE_HASH = state_hash(state)
     try:
         run(groups, state)  # в конце сам сохраняет состояние в Worker
     except Exception:
@@ -1034,7 +1052,7 @@ def run(groups, state):
         save_state(state)
         # итог запуска виден на <RELAY_URL>/status — без доступа к логам Actions
         try:
-            state_bytes = flush_state(state)
+            state_bytes = flush_state(state)  # 0 — состояние не менялось
         except (requests.RequestException, ValueError) as e:
             state_bytes = None
             log.error("Не удалось сохранить состояние в Worker: %s", e)

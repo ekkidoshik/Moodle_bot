@@ -89,6 +89,8 @@ export default {
         catalog_groups: catalog && catalog.groups ? catalog.groups.length : 0,
         subscribers_in_worker: Object.keys(await listSubscribers(env)).length,
         last_bot_run: await env.BOT_KV.get("report", "json"),
+        bot_description: ((await tg(env, "getMyDescription", {})).result || {}).description || null,
+        bot_short_description: ((await tg(env, "getMyShortDescription", {})).result || {}).short_description || null,
       });
     }
 
@@ -121,7 +123,15 @@ export default {
         return json({ ok: true });
       }
       if (request.method === "POST" && url.pathname === "/api/report") {
-        await env.BOT_KV.put("report", JSON.stringify(await request.json()));
+        // KV бесплатно — 1000 записей в сутки, а отчёт приходит каждые несколько минут:
+        // пишем, если что-то поменялось или сохранённому отчёту больше 20 минут (сторожу хватит)
+        const report = await request.json();
+        const prev = await env.BOT_KV.get("report", "json");
+        const strip = (r) => JSON.stringify({ ...r, ts: 0, time: "", state_bytes: 0 });
+        const fresh = prev && prev.ts && report.ts - prev.ts < 20 * 60;
+        if (!(prev && fresh && strip(prev) === strip(report))) {
+          await env.BOT_KV.put("report", JSON.stringify(report));
+        }
         return json({ ok: true });
       }
       if (request.method === "PUT" && url.pathname.startsWith("/api/index/")) {
@@ -256,6 +266,11 @@ function groupsKeyboard(catalog, current) {
   return { keyboard: rows, resize_keyboard: true, is_persistent: true, input_field_placeholder: "Выберите группу" };
 }
 
+// как часто бот проверяет Moodle — приходит из каталога (CHECK_EVERY_MIN в moodle_bot.py)
+function checkEvery(catalog) {
+  return (catalog && catalog.check_every) || 5;
+}
+
 function groupTitle(catalog, key) {
   const g = catalog.groups.find((x) => x.key === key);
   return g ? g.title : key;
@@ -296,7 +311,7 @@ function coursesKeyboard(catalog, key, muted) {
 function coursesText(catalog, key) {
   const names = catalog.course_names[key] || {};
   if (!Object.keys(names).length) {
-    return `Курсы группы <b>${esc(groupTitle(catalog, key))}</b> появятся после ближайшей проверки Moodle (до 15 минут).`;
+    return `Курсы группы <b>${esc(groupTitle(catalog, key))}</b> появятся после ближайшей проверки Moodle (до ${checkEvery(catalog)} минут).`;
   }
   return (`📚 Курсы группы <b>${esc(groupTitle(catalog, key))}</b>.\n\n` +
     "Нажмите на курс, чтобы отключить 🔕 или включить 🔔 по нему уведомления о файлах и дедлайнах.");
@@ -504,7 +519,7 @@ async function broadcastCommand(env, catalog, chatId, text) {
   const queue = (await env.BOT_KV.get("broadcasts", "json")) || [];
   queue.push({ group, text: body });
   await env.BOT_KV.put("broadcasts", JSON.stringify(queue));
-  return send(env, chatId, `📣 Получателей ${targets.length} (${whom}) — разошлю при ближайшей проверке, в течение 15 минут.`);
+  return send(env, chatId, `📣 Получателей ${targets.length} (${whom}) — разошлю при ближайшей проверке, в течение ${checkEvery(catalog)} минут.`);
 }
 
 // ------------------------------ Обработка ------------------------------
@@ -535,7 +550,7 @@ async function handleMessage(msg, catalog, env) {
   const command = text.startsWith("/") ? text.split(/\s+/)[0].split("@")[0].toLowerCase() : "";
 
   if (!catalog || !catalog.groups || !catalog.groups.length) {
-    return send(env, chatId, "Бот ещё настраивается. Попробуйте через 15 минут.");
+    return send(env, chatId, "Бот ещё настраивается. Попробуйте через несколько минут.");
   }
   const sub = await getSub(env, chatId);
   const current = sub && catalog.groups.some((g) => g.key === sub.g) ? sub.g : null;

@@ -1,6 +1,6 @@
 name: Moodle Telegram Bot
 
-# Запускается внешним cron-job раз в 15 минут через workflow_dispatch.
+# Запускается внешним cron-job раз в 5 минут через workflow_dispatch.
 on:
   workflow_dispatch:
 
@@ -41,6 +41,7 @@ jobs:
           # не сохраняется — оставлять так надолго нельзя.
           RELAY_URL: https://moodle-bot-relay.econ-msu-bot.workers.dev
           BOT_SYNC_SECRET: ${{ secrets.BOT_SYNC_SECRET }}
+          CHECK_EVERY_MIN: "5"   # интервал cron-job — для текстов бота
           GROUPS_FILE: groups.json
           # состояние хранится в Cloudflare KV (через Worker); локальный файл — временный
           STATE_FILE: state.json
