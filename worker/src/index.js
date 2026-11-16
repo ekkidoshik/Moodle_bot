@@ -21,7 +21,6 @@
 // Хранилище — KV (binding BOT_KV): "catalog", "index:<g>", "broadcasts", "report" и
 // "sub:<chat_id>" = {g: группа, m: отключённые курсы, r: окна напоминаний (с), f: файлы,
 // s: сводка в 20:00}, "done:<chat_id>" = {d: [id сданных дедлайнов]}, "watchdog",
-// "rem:<chat_id>" = {r: [{id, due, text}]} — свои напоминания (присылает бот при проверке),
 // "subs_version" — метка последнего изменения подписчиков: бот перечитывает список
 // (KV list — 1000 в сутки бесплатно), только когда метка сменилась.
 // (дублируется в metadata, чтобы список подписчиков читался одним list без get).
@@ -30,21 +29,11 @@
 const BTN_COURSES = "📚 Мои курсы";
 const BTN_DEADLINES = "⏰ Дедлайны";
 const BTN_SETTINGS = "⚙️ Настройки";
-const BTN_WORKS = "📝 Контрольные";
-// виды работ (moodle_bot.py → ASSESSMENT_KINDS): значок, название; major — показывать в «ближайших»
-const WORK_KINDS = {
-  exam: ["🎓", "Экзамен", true], credit: ["✅", "Зачёт", true], retake: ["🔁", "Пересдача", true],
-  colloq: ["🗣", "Коллоквиум", true], kr: ["📝", "Контрольная", true], mkr: ["🔹", "Микроконтрольная", true],
-  sr: ["✍️", "Самостоятельная", true], test: ["🧪", "Тест", false], hw: ["🏠", "Задание", false],
-  essay: ["📄", "Эссе / проект", true],
-};
-const WORK_ORDER = ["exam", "credit", "retake", "colloq", "kr", "mkr", "sr", "essay", "test", "hw"];
 const REMINDER_OPTIONS = [[259200, "за 3 дня"], [86400, "за сутки"], [10800, "за 3 часа"], [3600, "за 1 час"]];
 const DEFAULT_REMINDERS = [86400, 10800];
 const SEARCH_LIMIT = 15;
 const DIRECT_BROADCAST_LIMIT = 40; // лимит бесплатного Worker — 50 запросов за вызов
 const WATCHDOG_MAX_AGE = 3600; // сек без отчёта о проверке Moodle — повод написать админу
-const MAX_CUSTOM_REMINDERS = 20;
 let ORIGIN = ""; // адрес этого Worker, нужен для ссылки на календарь
 const DEADLINES_LIST_DAYS = 14;
 const WEEKDAYS = ["вс", "пн", "вт", "ср", "чт", "пт", "сб"];
@@ -117,7 +106,7 @@ export default {
         if (since === null) return json(await listSubscribers(env)); // старый формат
         const version = (await env.BOT_KV.get("subs_version")) || "0";
         if (since === version) return json({ version, unchanged: true });
-        return json({ version, subs: await listSubscribers(env, true) });
+        return json({ version, subs: await listSubscribers(env) });
       }
       if (request.method === "POST" && url.pathname === "/api/subscribers") {
         const body = await request.json();
@@ -153,8 +142,8 @@ export default {
         }
         return json({ ok: true });
       }
-      // индекс поиска и список работ — храним как пришли, без разбора (экономим CPU)
-      const upload = url.pathname.match(/^\/api\/(index|works)\/([a-z0-9_]+)$/);
+      // индекс поиска — храним как пришёл, без разбора (экономим CPU)
+      const upload = url.pathname.match(/^\/api\/(index)\/([a-z0-9_]+)$/);
       if (request.method === "PUT" && upload) {
         await env.BOT_KV.put(`${upload[1]}:${upload[2]}`, await request.text());
         return json({ ok: true });
@@ -220,7 +209,7 @@ async function touchSubs(env) {
   await env.BOT_KV.put("subs_version", `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
 }
 
-async function listSubscribers(env, withCustom = false) {
+async function listSubscribers(env) {
   const result = {};
   let cursor;
   do {
@@ -245,30 +234,7 @@ async function listSubscribers(env, withCustom = false) {
     }
     cursor = page.list_complete ? undefined : page.cursor;
   } while (cursor);
-  if (withCustom) {
-    do {
-      const page = await env.BOT_KV.list({ prefix: "rem:", cursor });
-      for (const k of page.keys) {
-        const chat = k.name.slice(4);
-        if (result[chat]) result[chat].custom = await getRems(env, chat);
-      }
-      cursor = page.list_complete ? undefined : page.cursor;
-    } while (cursor);
-  }
   return result;
-}
-
-async function getRems(env, chatId) {
-  const v = await env.BOT_KV.get(`rem:${chatId}`, "json");
-  return (v && v.r) || [];
-}
-
-async function putRems(env, chatId, list) {
-  const now = Date.now() / 1000;
-  const keep = list.filter((r) => r.due > now - 86400).sort((a, b) => a.due - b.due);
-  if (keep.length) await env.BOT_KV.put(`rem:${chatId}`, JSON.stringify({ r: keep }));
-  else await env.BOT_KV.delete(`rem:${chatId}`);
-  await touchSubs(env);
 }
 
 async function getDone(env, chatId) {
@@ -310,7 +276,7 @@ function groupsKeyboard(catalog, current) {
   const rows = [];
   for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
   rows.push([{ text: BTN_COURSES }, { text: BTN_DEADLINES }]);
-  rows.push([{ text: BTN_WORKS }, { text: BTN_SETTINGS }]);
+  rows.push([{ text: BTN_SETTINGS }]);
   return { keyboard: rows, resize_keyboard: true, is_persistent: true, input_field_placeholder: "Выберите группу" };
 }
 
@@ -445,163 +411,6 @@ async function calendarText(env, catalog, key) {
     "• <b>Google Календарь</b> (с компьютера): «Другие календари» → «+» → «Добавить по URL».\n" +
     "• <b>iPhone</b>: Настройки → Календарь → Учётные записи → Новая учётная запись → Другое → " +
     "Подписной календарь.");
-}
-
-// ------------------------------ Контрольные и экзамены ------------------
-
-function fmtWorkDate(w) {
-  if (!w.d) return "";
-  if (w.h) return fmtTime(w.d);
-  const d = new Date((w.d + 3 * 3600) * 1000);
-  const p = (n) => String(n).padStart(2, "0");
-  return `${WEEKDAYS[d.getUTCDay()]} ${p(d.getUTCDate())}.${p(d.getUTCMonth() + 1)}`;
-}
-
-function workLine(w, withCourse, names) {
-  const [icon, label] = WORK_KINDS[w.k] || ["•", "Работа"];
-  const title = w.u ? `<a href="${esc(w.u)}">${esc(w.n)}</a>` : esc(w.n);
-  const date = w.d ? ` — <b>${fmtWorkDate(w)}</b>` : "";
-  const course = withCourse ? `\n      ${esc(names[w.c] || `Курс ${w.c}`)}` : "";
-  return `${icon} ${label}: ${title}${date}${course}`;
-}
-
-async function getWorks(env, key) {
-  return (await env.BOT_KV.get(`works:${key}`, "json")) || [];
-}
-
-// Общий вид: ближайшие крупные работы по всем курсам + кнопки курсов
-function worksOverview(catalog, key, works, muted) {
-  const names = catalog.course_names[key] || {};
-  const now = Date.now() / 1000;
-  const mine = works.filter((w) => !muted.includes(w.c));
-  const title = `📝 <b>Контрольные, экзамены и зачёты — ${esc(groupTitle(catalog, key))}</b>`;
-  if (!mine.length) {
-    return { text: `${title}\n\nВ курсах пока не нашлось ничего похожего на контрольные, экзамены или зачёты.` };
-  }
-  const soon = mine.filter((w) => w.d && w.d > now - 86400 && (WORK_KINDS[w.k] || [])[2]).slice(0, 8);
-  const counts = {};
-  for (const w of mine) counts[w.c] = (counts[w.c] || 0) + 1;
-  const courses = Object.keys(counts).sort((a, b) => (names[a] || a).localeCompare(names[b] || b, "ru"));
-  return {
-    text: `${title}\n\n` +
-      (soon.length ? "<b>Ближайшие:</b>\n" + soon.map((w) => workLine(w, true, names)).join("\n") + "\n\n" : "") +
-      "Выберите курс, чтобы увидеть все найденные работы:\n" +
-      "<i>Список собран по названиям материалов и разделов курса — что-то может не попасть или оказаться лишним.</i>",
-    markup: { inline_keyboard: courses.map((c) => [{ text: `${names[c] || `Курс ${c}`} · ${counts[c]}`.slice(0, 60), callback_data: `w:${c}` }]) },
-  };
-}
-
-function worksCourse(catalog, key, works, cid) {
-  const names = catalog.course_names[key] || {};
-  const mine = works.filter((w) => w.c === cid);
-  const lines = [];
-  for (const kind of WORK_ORDER) {
-    for (const w of mine.filter((x) => x.k === kind)) lines.push(workLine(w, false, names));
-  }
-  const shown = lines.slice(0, 40);
-  return {
-    text: `📝 <b>${esc(names[cid] || `Курс ${cid}`)}</b>\n\n` + (shown.join("\n") || "Ничего не нашлось.") +
-      (lines.length > shown.length ? `\n\n…и ещё ${lines.length - shown.length}` : ""),
-    markup: { inline_keyboard: [[{ text: "⬅️ Все курсы", callback_data: "w:" }]] },
-  };
-}
-
-// ------------------------------ Свои напоминания -----------------------
-
-const WEEKDAY_WORDS = {
-  пн: 1, понедельник: 1, вт: 2, вторник: 2, ср: 3, среда: 3, среду: 3, чт: 4, четверг: 4,
-  пт: 5, пятница: 5, пятницу: 5, сб: 6, суббота: 6, субботу: 6, вс: 0, воскресенье: 0,
-};
-
-// Москва без перехода на летнее: «стенные» часы МСК = UTC + 3
-function mskParts(sec) {
-  const d = new Date((sec + 3 * 3600) * 1000);
-  return { y: d.getUTCFullYear(), m: d.getUTCMonth(), d: d.getUTCDate(), wd: d.getUTCDay() };
-}
-
-function mskToSec(y, m, d, hh, mm) {
-  return Date.UTC(y, m, d, hh, mm) / 1000 - 3 * 3600;
-}
-
-// «завтра 10:00 текст», «пт 18:00 текст», «20.11 9:30 текст», «18:00 текст»,
-// «через 2 часа текст», «через 30 минут текст». Возвращает {due, text} или null.
-function parseRemind(input, now) {
-  let rest = input.trim();
-  const take = (re) => {
-    const m = rest.match(re);
-    if (m) rest = rest.slice(m[0].length).trim();
-    return m;
-  };
-  let m = take(/^через\s+(\d+)?\s*(минут[уы]?|мин|час(?:а|ов)?|ч|дн(?:я|ей)?|день|недел[юиь])(?=\s|$)/i);
-  if (m) {
-    const n = m[1] ? Number(m[1]) : 1;
-    const u = m[2].toLowerCase();
-    const mult = u.startsWith("мин") ? 60 : u.startsWith("ч") ? 3600 : u.startsWith("нед") ? 7 * 86400 : 86400;
-    return { due: Math.round(now + n * mult), text: rest || "Напоминание" };
-  }
-  let day = null; // {y, m, d}
-  const today = mskParts(now);
-  if ((m = take(/^(сегодня|завтра|послезавтра)(?=\s|$)/i))) {
-    const off = { сегодня: 0, завтра: 1, послезавтра: 2 }[m[1].toLowerCase()];
-    day = mskParts(now + off * 86400);
-  } else if ((m = take(/^([а-яё]+)(?=\s|$)/i)) && WEEKDAY_WORDS[m[1].toLowerCase()] !== undefined) {
-    let off = (WEEKDAY_WORDS[m[1].toLowerCase()] - today.wd + 7) % 7;
-    day = { ...mskParts(now + off * 86400), weekday: true };
-  } else {
-    if (m) rest = `${m[0]} ${rest}`.trim(); // это было не слово-день — вернём на место
-    if ((m = take(/^(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?(?=\s|$)/))) {
-      const mo = Number(m[2]) - 1;
-      if (mo < 0 || mo > 11) return null;
-      let y = m[3] ? Number(m[3].length === 2 ? "20" + m[3] : m[3]) : today.y;
-      day = { y, m: mo, d: Number(m[1]) };
-      if (!m[3] && mskToSec(y, mo, day.d, 23, 59) < now) day.y += 1; // дата уже прошла — следующий год
-    }
-  }
-  let hh = 9, mm = 0, hasTime = false;
-  if ((m = take(/^(?:в\s+)?(\d{1,2}):(\d{2})(?=\s|$)/i))) {
-    hh = Number(m[1]); mm = Number(m[2]); hasTime = true;
-    if (hh > 23 || mm > 59) return null;
-  }
-  if (!day && !hasTime) return null;
-  const base = day || today;
-  let due = mskToSec(base.y, base.m, base.d, hh, mm);
-  if (due <= now) {
-    if (!day) due += 86400;                  // «18:00» уже прошло — завтра
-    else if (day.weekday) due += 7 * 86400;  // «пт 18:00», а пятница уже прошла — следующая
-    else return null;                        // явная дата в прошлом
-  }
-  if (due - now > 366 * 86400) return null;
-  return { due, text: rest || "Напоминание" };
-}
-
-const REMIND_HELP =
-  "🔔 <b>Своё напоминание</b>\n\n" +
-  "<code>/remind завтра 10:00 сдать эссе</code>\n" +
-  "<code>/remind пт 18:00 купить тетрадь</code>\n" +
-  "<code>/remind 20.11 9:30 записаться на пересдачу</code>\n" +
-  "<code>/remind 18:00 позвонить старосте</code>\n" +
-  "<code>/remind через 2 часа проверить почту</code>\n\n" +
-  "Время — по Москве, без времени — в 9:00. Список: /reminders";
-
-function remindersMessage(list) {
-  const now = Date.now() / 1000;
-  const items = list.filter((r) => r.due > now);
-  if (!items.length) return { text: "🔔 Активных напоминаний нет.\n\n" + REMIND_HELP };
-  return {
-    text: "🔔 <b>Мои напоминания</b>\n\n" +
-      items.map((r) => `• <b>${fmtTime(r.due)}</b> — ${esc(r.text)}`).join("\n") +
-      "\n\nНажмите ❌, чтобы удалить.",
-    markup: { inline_keyboard: items.slice(0, 20).map((r) => [{ text: `❌ ${fmtTime(r.due)} ${r.text}`.slice(0, 60), callback_data: `x:${r.id}` }]) },
-  };
-}
-
-async function addReminder(env, chatId, due, text) {
-  const list = await getRems(env, chatId);
-  const active = list.filter((r) => r.due > Date.now() / 1000);
-  if (active.length >= MAX_CUSTOM_REMINDERS) return null;
-  const r = { id: `${chatId}-${Date.now().toString(36)}${Math.floor(Math.random() * 1296).toString(36)}`, due, text: text.slice(0, 300) };
-  await putRems(env, chatId, [...list, r]);
-  return r;
 }
 
 // ------------------------------ Сторож ---------------------------------
@@ -788,29 +597,6 @@ async function handleMessage(msg, catalog, env) {
     if (!current) return send(env, chatId, "Сначала выберите группу: /start");
     return send(env, chatId, await searchText(env, catalog, current, text.replace(/^\/search(@\S+)?/i, "")));
   }
-  if (command === "/works" || text === BTN_WORKS) {
-    if (!current) return send(env, chatId, "Сначала выберите группу: /start");
-    const wo = worksOverview(catalog, current, await getWorks(env, current), muted);
-    return send(env, chatId, wo.text, wo.markup ? { reply_markup: wo.markup } : {});
-  }
-  if (command === "/remind") {
-    if (!current) return send(env, chatId, "Сначала выберите группу: /start");
-    const args = text.replace(/^\/remind(@\S+)?/i, "").trim();
-    if (!args) return send(env, chatId, REMIND_HELP);
-    const parsed = parseRemind(args, Date.now() / 1000);
-    if (!parsed) return send(env, chatId, "Не понял, когда напомнить.\n\n" + REMIND_HELP);
-    const r = await addReminder(env, chatId, parsed.due, parsed.text);
-    if (!r) return send(env, chatId, `Можно не больше ${MAX_CUSTOM_REMINDERS} активных напоминаний. Удалите лишние: /reminders`);
-    return send(env, chatId,
-      `🔔 Напомню <b>${fmtTime(r.due)}</b>: ${esc(r.text)}\n\n` +
-      `<i>Напоминание придёт в течение ${checkEvery(catalog)} минут после этого времени.</i>`,
-      { reply_markup: { inline_keyboard: [[{ text: "❌ Отменить", callback_data: `x:${r.id}` }]] } });
-  }
-  if (command === "/reminders") {
-    if (!current) return send(env, chatId, "Сначала выберите группу: /start");
-    const rm = remindersMessage(await getRems(env, chatId));
-    return send(env, chatId, rm.text, rm.markup ? { reply_markup: rm.markup } : {});
-  }
   if (command === "/calendar") {
     if (!current) return send(env, chatId, "Сначала выберите группу: /start");
     return send(env, chatId, await calendarText(env, catalog, current));
@@ -834,7 +620,6 @@ async function handleMessage(msg, catalog, env) {
     if (sub) {
       await env.BOT_KV.delete(`sub:${chatId}`);
       await env.BOT_KV.delete(`done:${chatId}`);
-      await env.BOT_KV.delete(`rem:${chatId}`);
       await touchSubs(env);
       return send(env, chatId, "Вы отписаны от уведомлений. /start — подписаться снова.",
         { reply_markup: { remove_keyboard: true } });
@@ -885,37 +670,6 @@ async function handleCallback(cq, catalog, env) {
       chat_id: chatId, message_id: msg.message_id, reply_markup: coursesKeyboard(catalog, current, next),
     });
   }
-  if (data.startsWith("w:")) {
-    if (!sub || !catalog.groups.some((g) => g.key === sub.g)) return answer("Сначала выберите группу: /start");
-    const works = await getWorks(env, sub.g);
-    const view = data === "w:" ? worksOverview(catalog, sub.g, works, sub.m || []) : worksCourse(catalog, sub.g, works, data.slice(2));
-    await answer("");
-    return tg(env, "editMessageText", {
-      chat_id: chatId, message_id: msg.message_id, text: view.text, parse_mode: "HTML",
-      disable_web_page_preview: true, reply_markup: view.markup || { inline_keyboard: [] },
-    });
-  }
-
-  if (data.startsWith("x:")) {
-    const id = data.slice(2);
-    const list = await getRems(env, chatId);
-    const r = list.find((x) => x.id === id);
-    if (!r) return answer("Это напоминание уже удалено");
-    await putRems(env, chatId, list.filter((x) => x.id !== id));
-    await answer("❌ Напоминание удалено");
-    const kb = ((msg.reply_markup && msg.reply_markup.inline_keyboard) || [])
-      .map((row) => row.filter((b) => b.callback_data !== data)).filter((row) => row.length);
-    return tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: kb } });
-  }
-
-  if (data === "rt") {
-    if (!sub) return answer("Сначала выберите группу: /start");
-    const t = mskParts(Date.now() / 1000 + 86400);
-    const title = (msg.text || "").split("\n")[0].trim() || "новые материалы";
-    const r = await addReminder(env, chatId, mskToSec(t.y, t.m, t.d, 10, 0), `Посмотреть: ${title}`);
-    return answer(r ? "🔔 Напомню завтра в 10:00" : `Уже ${MAX_CUSTOM_REMINDERS} напоминаний — удалите лишние: /reminders`);
-  }
-
   if (data.startsWith("d:")) {
     const id = data.slice(2);
     if (!sub || !catalog.groups.some((g) => g.key === sub.g)) return answer("Сначала выберите группу: /start");
