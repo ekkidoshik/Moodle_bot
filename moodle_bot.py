@@ -25,15 +25,19 @@
   <token_env группы>   — Moodle-токен каждой группы, имя переменной задаётся в groups.json
 """
 
+import difflib
 import hashlib
 import html
+import io
 import json
 import logging
 import os
 import re
 import sys
 import time
+import zipfile
 from datetime import datetime, timedelta, timezone
+from xml.etree import ElementTree
 
 import requests
 
@@ -61,7 +65,7 @@ RENAMED_GROUPS = {"my-group": "m104"}
 
 # Команды бота: ключи групп не должны с ними совпадать.
 RESERVED_COMMANDS = {"start", "stop", "courses", "deadlines", "search", "settings",
-                     "stats", "broadcast", "calendar", "id"}
+                     "stats", "broadcast", "calendar", "id", "remind", "reminders", "works"}
 BTN_COURSES = "📚 Мои курсы"
 BTN_DEADLINES = "⏰ Дедлайны"
 
@@ -77,6 +81,16 @@ MAX_FILES_PER_COURSE = 10  # за один запуск, чтобы не зав�
 # Сводка: у кого она включена, сообщения о новых файлах копятся и приходят одним
 # сообщением при первой проверке после DIGEST_HOUR по Москве (файлы — ссылками).
 DIGEST_HOUR = 20
+
+# кнопка под уведомлениями о материалах: Worker заводит напоминание на завтра 10:00
+REMIND_TOMORROW = {"inline_keyboard": [[{"text": "🔔 Напомнить завтра", "callback_data": "rt"}]]}
+
+# «Что изменилось в файле»: для каждого файла храним хэши страниц/слайдов/абзацев.
+# Для файлов, которые лежали в Moodle до этой функции, отпечатки набираются
+# постепенно — не больше BACKFILL_* за запуск, чтобы не нагружать Moodle.
+BACKFILL_FILES = 8
+BACKFILL_BYTES = 60 * 1024 * 1024
+BACKFILL_SECONDS = 90
 DEADLINES_LIST_DAYS = 14  # сколько дней вперёд показывать в /deadlines
 
 MSK = timezone(timedelta(hours=3))  # время МГУ, без перехода на летнее
@@ -146,12 +160,22 @@ def moodle(token, function, **params):
 
 def get_snapshot(token, course_id):
     """Текущее содержимое курса: ({id материала: {название, ссылка, файлы}},
-    {id материала: {файл: {url, size}}}) — второе нужно, чтобы скачать файл."""
+    {id материала: {файл: {url, size}}, "_info": {...}}) — второе нужно, чтобы скачать
+    файл, а "_info" (все модули с типом и разделом, включая подписи) — для поиска
+    контрольных, экзаменов и т. п."""
     sections = moodle(token, "core_course_get_contents", courseid=course_id)
     snapshot, meta = {}, {}
+    info = meta["_info"] = {"modules": [], "sections": []}
     for section in sections:
+        info["sections"].append({"num": section.get("section", 0), "name": section.get("name") or ""})
         for m in section.get("modules", []):
-            if m.get("modname") == "label":  # просто текстовые подписи пропускаем
+            text = m.get("name", "")
+            if m.get("modname") == "label":  # у подписи текст — в description (HTML)
+                text = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", m.get("description") or text))).strip()
+                text = re.sub(r"\s+([,.;:!?)])", r"\1", text)
+            info["modules"].append({"id": str(m["id"]), "mod": m.get("modname", ""), "text": text[:300],
+                                    "url": m.get("url", ""), "section": section.get("section", 0)})
+            if m.get("modname") == "label":  # в уведомлениях о материалах подписи не нужны
                 continue
             files = {}
             for f in m.get("contents", []) or []:
@@ -203,6 +227,157 @@ def changed_files(old, new):
             if old_files.get(key) != modified:
                 result.append((mid, key))
     return result
+
+
+# ---------------------------- Что изменилось в файле -------------------
+
+def short_hash(text):
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:10]
+
+
+def _xml_texts(xml_bytes, unit_tag, text_tag):
+    """Тексты блоков (абзацев/слайда) из XML офисного файла, без лишних зависимостей."""
+    root = ElementTree.fromstring(xml_bytes)
+    blocks = []
+    for el in root.iter():
+        if el.tag.endswith("}" + unit_tag):
+            blocks.append("".join(t.text or "" for t in el.iter() if t.tag.endswith("}" + text_tag)))
+    return blocks
+
+
+def fingerprint(name, content):
+    """Отпечаток файла: {"k": вид, "h": [хэши частей], "s": размер} и тексты частей
+    (тексты не храним — только для цитаты в сообщении)."""
+    ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
+    texts = None
+    try:
+        if ext == "pdf":
+            from pypdf import PdfReader
+            texts = []
+            for page in PdfReader(io.BytesIO(content)).pages:
+                t = (page.extract_text() or "").strip()
+                if not t:  # скан: сравниваем содержимое страницы как есть
+                    data = page.get_contents()
+                    t = "raw:" + hashlib.sha256(data.get_data() if data else b"").hexdigest()
+                texts.append(t)
+        elif ext == "pptx":
+            with zipfile.ZipFile(io.BytesIO(content)) as z:
+                slides = sorted((n for n in z.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
+                                key=lambda n: int(re.findall(r"\d+", n)[0]))
+                texts = [" ".join(_xml_texts(z.read(n), "p", "t")).strip() for n in slides]
+        elif ext == "docx":
+            with zipfile.ZipFile(io.BytesIO(content)) as z:
+                texts = [t.strip() for t in _xml_texts(z.read("word/document.xml"), "p", "t") if t.strip()]
+    except Exception as e:  # битый/зашифрованный файл — сравним целиком
+        log.info("Не удалось разобрать %s: %s", name, e)
+        texts = None
+    if texts is None:
+        return {"k": "bin", "h": [short_hash(hashlib.sha256(content).hexdigest())], "s": len(content)}, None
+    kind = {"pdf": "pdf", "pptx": "pptx", "docx": "docx"}[ext]
+    return {"k": kind, "h": [short_hash(t) for t in texts], "s": len(content)}, texts
+
+
+def plural(n, one, few, many):
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    return few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
+
+
+def ranges(nums):
+    out, start, prev = [], None, None
+    for n in nums:
+        if start is None:
+            start = prev = n
+        elif n == prev + 1:
+            prev = n
+        else:
+            out.append(f"{start}–{prev}" if prev > start else str(start))
+            start = prev = n
+    if start is not None:
+        out.append(f"{start}–{prev}" if prev > start else str(start))
+    return ", ".join(out)
+
+
+def fmt_size(n):
+    return f"{n / 1024 / 1024:.1f} МБ" if n >= 1024 * 1024 else f"{max(1, n // 1024)} КБ"
+
+
+def describe_diff(old, new, texts):
+    """Человеческое описание разницы двух отпечатков (или None, если сказать нечего)."""
+    if old.get("h") == new["h"]:
+        return "содержимое не изменилось — файл просто перезалили"
+    if new["k"] == "bin" or old.get("k") != new["k"]:
+        if not old.get("s"):
+            return None
+        if fmt_size(old["s"]) == fmt_size(new["s"]):
+            return "содержимое изменилось, размер прежний"
+        return f"размер {fmt_size(old['s'])} → {fmt_size(new['s'])}"
+
+    changed, added, removed = [], [], []
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old["h"], new["h"], autojunk=False).get_opcodes():
+        if tag == "replace":
+            # общая часть — изменённые; лишнее в новом — добавленные, в старом — удалённые
+            common = min(i2 - i1, j2 - j1)
+            changed += range(j1 + 1, j1 + common + 1)
+            added += range(j1 + common + 1, j2 + 1)
+            removed += range(i1 + common + 1, i2 + 1)
+        elif tag == "insert":
+            added += range(j1 + 1, j2 + 1)
+        elif tag == "delete":
+            removed += range(i1 + 1, i2 + 1)
+
+    parts = []
+    # глагол в роде и числе: (один м.р., одна ж.р., несколько)
+    verbs = {"ch": ("изменён", "изменена", "изменены"), "add": ("добавлен", "добавлена", "добавлены"),
+             "rm": ("удалён", "удалена", "удалены")}
+    for nums, v in ((changed, "ch"), (added, "add"), (removed, "rm")):
+        if not nums:
+            continue
+        n = len(nums)
+        if new["k"] == "docx":  # номера абзацев ничего не скажут — только количество
+            verb = verbs[v][0] if n % 10 == 1 and n % 100 != 11 else verbs[v][2]
+            parts.append(f"{verb} {n} {plural(n, 'абзац', 'абзаца', 'абзацев')}")
+        elif new["k"] == "pdf":
+            parts.append(f"{verbs[v][1] if n == 1 else verbs[v][2]} {'страница' if n == 1 else 'страницы'} {ranges(nums)}")
+        else:
+            parts.append(f"{verbs[v][0] if n == 1 else verbs[v][2]} {'слайд' if n == 1 else 'слайды'} {ranges(nums)}")
+    if not parts:
+        return None
+    result = ", ".join(parts)
+    # цитата первого изменённого/добавленного места
+    first = (changed or added or [None])[0]
+    if texts and first and first <= len(texts) and not texts[first - 1].startswith("raw:"):
+        quote = re.sub(r"\s+", " ", texts[first - 1]).strip()
+        if quote:
+            result += f"\n      «{html.escape(quote[:120])}{'…' if len(quote) > 120 else ''}»"
+    return result
+
+
+class FileFetcher:
+    """Скачивает файлы курса из Moodle не больше одного раза за запуск."""
+
+    def __init__(self, token, meta):
+        self.token, self.meta, self.cache = token, meta, {}
+
+    def info(self, mid, key):
+        return self.meta.get(mid, {}).get(key)
+
+    def get(self, mid, key):
+        if (mid, key) in self.cache:
+            return self.cache[(mid, key)]
+        info, content = self.info(mid, key), None
+        if info and info["url"] and info["size"] <= MAX_FILE_BYTES:
+            try:
+                r = requests.get(info["url"], params={"token": self.token}, timeout=120)
+                r.raise_for_status()
+                if "application/json" in r.headers.get("content-type", ""):
+                    log.warning("Moodle не отдал файл %s: %s", key, r.text[:200])
+                elif len(r.content) <= MAX_FILE_BYTES:
+                    content = r.content
+            except requests.RequestException as e:
+                log.warning("Не удалось скачать %s: %s", key, e)
+        self.cache[(mid, key)] = content
+        return content
 
 
 # ---------------------------- Telegram --------------------------------
@@ -281,6 +456,10 @@ def empty_state():
         "done": {},          # chat_id -> [id дедлайнов, отмеченных «✅ Сдал»]
         "digest": {},        # chat_id -> [накопленные для сводки сообщения]
         "digest_day": "",    # дата (МСК), за которую сводка уже разослана
+        "custom": {},        # chat_id -> [{id, due, text}] — свои напоминания из Worker
+        "fired": {},         # id своего напоминания -> срок (уже отправлено)
+        "fingerprints": {},  # группа -> курс -> "id материала|файл" -> {k, h, s, t}
+        "assessments": {},   # группа -> [{c, k, n, u, d, h, s}] — контрольные, экзамены, зачёты...
     }
 
 
@@ -380,9 +559,12 @@ def setup_bot_profile(groups, state):
     commands += [
         {"command": "courses", "description": "Мои курсы и отключение ненужных"},
         {"command": "deadlines", "description": "Ближайшие дедлайны"},
+        {"command": "works", "description": "Контрольные, экзамены, зачёты по курсам"},
         {"command": "search", "description": "Поиск по материалам курсов"},
         {"command": "settings", "description": "Напоминания, файлы, сводка"},
         {"command": "calendar", "description": "Дедлайны в календаре телефона"},
+        {"command": "remind", "description": "Своё напоминание: /remind завтра 10:00 текст"},
+        {"command": "reminders", "description": "Мои напоминания"},
         {"command": "stop", "description": "Отписаться от уведомлений"},
     ]
     description = (
@@ -664,7 +846,32 @@ def sync_telegram(groups, state):
            allowed_updates=["message", "callback_query"])
         log.info("Webhook установлен: сообщения теперь принимает Worker")
 
-    subs = relay("GET", "/api/subscribers")
+    # список перечитываем, только если в Worker что-то поменялось (KV: 1000 list в сутки)
+    resp = relay("GET", "/api/subscribers?since=" + requests.utils.quote(state.get("subs_version", "")))
+    if resp.get("unchanged"):
+        log.info("Подписчики не менялись (%d)", len(state["subscribers"]))
+    elif "subs" not in resp:  # Worker старой версии (ещё не развернулся) — прежний формат
+        apply_subscribers(state, resp)
+    else:
+        apply_subscribers(state, resp["subs"])
+        state["subs_version"] = resp["version"]
+        log.info("Подписчиков из Worker: %d", len(state["subscribers"]))
+
+    send_custom_reminders(state)
+
+    # рассылки /broadcast, которые Worker не успел отправить сам (много получателей)
+    for b in relay("POST", "/api/broadcasts/take"):
+        chats = [c for c, g in state["subscribers"].items()
+                 if not b.get("group") or g == b["group"]]
+        for chat_id in chats:
+            try:
+                send_message(chat_id, b["text"], html_mode=False)
+            except (TelegramError, requests.RequestException) as e:
+                log.warning("Рассылка в %s не ушла: %s", mask(chat_id), e)
+        log.info("Рассылка отправлена: %d получателей", len(chats))
+
+
+def apply_subscribers(state, subs):
     state["subscribers"] = {chat: s["group"] for chat, s in subs.items() if s.get("group")}
     state["muted"] = {chat: s["muted"] for chat, s in subs.items() if s.get("muted")}
     state["prefs"] = {}
@@ -679,18 +886,26 @@ def sync_telegram(groups, state):
         if p:
             state["prefs"][chat] = p
     state["done"] = {chat: s["done"] for chat, s in subs.items() if s.get("done")}
-    log.info("Подписчиков из Worker: %d", len(state["subscribers"]))
+    state["custom"] = {chat: s["custom"] for chat, s in subs.items() if s.get("custom")}
 
-    # рассылки /broadcast, которые Worker не успел отправить сам (много получателей)
-    for b in relay("POST", "/api/broadcasts/take"):
-        chats = [c for c, g in state["subscribers"].items()
-                 if not b.get("group") or g == b["group"]]
-        for chat_id in chats:
-            try:
-                send_message(chat_id, b["text"], html_mode=False)
-            except (TelegramError, requests.RequestException) as e:
-                log.warning("Рассылка в %s не ушла: %s", mask(chat_id), e)
-        log.info("Рассылка отправлена: %d получателей", len(chats))
+
+def send_custom_reminders(state):
+    """Свои напоминания (/remind): Worker их хранит, а присылает бот при проверке —
+    с точностью до интервала cron-job. Отправленные запоминаем в state["fired"]."""
+    now = time.time()
+    fired = state.setdefault("fired", {})
+    for rid in [r for r, due in fired.items() if due < now - 3 * 86400]:
+        del fired[rid]
+    for chat_id, items in state.get("custom", {}).items():
+        if chat_id not in state["subscribers"]:
+            continue
+        for r in items:
+            if r["due"] > now or r["id"] in fired:
+                continue
+            fired[r["id"]] = r["due"]
+            if now - r["due"] > 6 * 3600:  # бот долго не работал — старое уже не актуально
+                continue
+            broadcast([chat_id], f"🔔 <b>Напоминание</b>\n\n{html.escape(r['text'])}", state)
 
 
 def push_to_relay(groups, state):
@@ -726,6 +941,16 @@ def push_to_relay(groups, state):
             relay("PUT", f"/api/index/{key}", index)
             sent_index[key] = sig
             log.info("Индекс поиска группы %s: %d материалов", key, len(index))
+
+    # контрольные, экзамены, зачёты — для кнопки «📝 Контрольные»
+    sent_works = state.setdefault("relay_works", {})
+    for key in groups:
+        works = state["assessments"].get(key, [])
+        sig = hashlib.sha256(json.dumps(works, ensure_ascii=False).encode()).hexdigest()
+        if sent_works.get(key) != sig:
+            relay("PUT", f"/api/works/{key}", works)
+            sent_works[key] = sig
+            log.info("Контрольные группы %s: %d", key, len(works))
 
 
 # ------------------------------ Moodle-проверка -----------------------
@@ -765,17 +990,20 @@ def broadcast(chat_ids, text, state, **extra):
     return delivered
 
 
-def get_deadlines(token, course_ids, old):
+def get_deadlines(token, course_ids, old, dated=None):
     """Задания и тесты со сроком сдачи в будущем. Если API не отдал какой-то вид —
-    оставляем прошлый список этого вида (токен может не иметь прав на функцию)."""
+    оставляем прошлый список этого вида (токен может не иметь прав на функцию).
+    dated (если передан) заполняется {cmid: срок} для всех заданий и тестов."""
     now = time.time()
     params = {f"courseids[{i}]": cid for i, cid in enumerate(course_ids)}
     items, failed = [], set()
+    dated = {} if dated is None else dated
 
     try:
         for course in moodle(token, "mod_assign_get_assignments", **params).get("courses", []):
             for a in course.get("assignments", []):
                 if a.get("duedate"):
+                    dated[str(a["cmid"])] = a["duedate"]
                     items.append({"id": f"assign:{a['id']}", "kind": "Задание",
                                   "course": str(course["id"]), "name": a.get("name", "Задание"),
                                   "due": a["duedate"],
@@ -786,6 +1014,8 @@ def get_deadlines(token, course_ids, old):
 
     try:
         for q in moodle(token, "mod_quiz_get_quizzes_by_courses", **params).get("quizzes", []):
+            if q.get("timeopen") or q.get("timeclose"):  # для контрольных важнее, когда тест открывается
+                dated[str(q["coursemodule"])] = q.get("timeopen") or q["timeclose"]
             if q.get("timeclose"):
                 items.append({"id": f"quiz:{q['id']}", "kind": "Тест",
                               "course": str(q["course"]), "name": q.get("name", "Тест"),
@@ -798,6 +1028,100 @@ def get_deadlines(token, course_ids, old):
     items += [d for d in old if d["id"].split(":")[0] in failed]
     allowed = {str(c) for c in course_ids}
     return [d for d in items if d["due"] > now and d["course"] in allowed]
+
+
+# ---------------------------- Контрольные, экзамены, зачёты -------------
+
+# порядок важен: первое совпадение определяет вид (пересдача экзамена — пересдача)
+ASSESSMENT_KINDS = [
+    ("retake", r"пересдач"),
+    ("exam", r"экзамен|\bэкз\b"),
+    ("credit", r"зачет"),
+    ("colloq", r"коллоквиум"),
+    ("mkr", r"микро\s*-?\s*контрольн|микроконтр|\bмкр\b"),
+    ("kr", r"контрольн|\bк/р\b|\bкр\s*-?\s*№?\s*\d"),
+    ("sr", r"самостоятельн|\bс/р\b|\bср\s*№?\s*\d"),
+    ("test", r"\bтест"),
+    ("hw", r"домашн|\bдз\b|\bд/з\b"),
+    ("essay", r"эссе|реферат|курсов\w* работ|проектн\w* работ|групповой проект"),
+]
+MONTHS = ["январ", "феврал", "март", "апрел", "ма", "июн", "июл", "август", "сентябр", "октябр", "ноябр", "декабр"]
+
+
+def classify(text):
+    t = text.lower().replace("ё", "е")
+    for kind, pattern in ASSESSMENT_KINDS:
+        if re.search(pattern, t):
+            return kind
+    return None
+
+
+def date_in_text(text, now):
+    """Дата из текста: «14.11», «14.11.2026», «14 ноября», с временем «в 10:30», если есть.
+    Возвращает (unix-время, есть ли время) или (None, False). Год без указания — ближайший."""
+    t = text.lower().replace("ё", "е")
+    m = re.search(r"(?<![\d.])(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?(?![\d.])", t)
+    day = month = year = None
+    if m and 1 <= int(m.group(2)) <= 12:
+        day, month = int(m.group(1)), int(m.group(2))
+        year = int(m.group(3)) if m.group(3) else None
+        if year and year < 100:
+            year += 2000
+    else:
+        months = "|".join("ма[яй]" if p == "ма" else p for p in MONTHS)  # «ма» — только май/мая
+        m = re.search(r"(?<!\d)(\d{1,2})\s+(" + months + r")[а-я]*", t)
+        if m:
+            day, month = int(m.group(1)), next(i for i, p in enumerate(MONTHS, 1) if m.group(2).startswith(p))
+    if not day or not 1 <= day <= 31:
+        return None, False
+    tm = re.search(r"(?<!\d)([01]?\d|2[0-3]):([0-5]\d)(?!\d)", t)
+    hh, mm = (int(tm.group(1)), int(tm.group(2))) if tm else (0, 0)
+    today = datetime.fromtimestamp(now, MSK)
+    # год не указан — ближайший будущий (или недавно прошедший: «результаты контрольной 14.10»)
+    for y in ([year] if year else [today.year, today.year + 1, today.year - 1]):
+        try:
+            when = datetime(y, month, day, hh, mm, tzinfo=MSK).timestamp()
+        except ValueError:
+            return None, False
+        if year or -60 * 86400 < when - now < 320 * 86400:
+            return int(when), bool(tm)
+    return None, False
+
+
+def find_assessments(cid, info, dated, now):
+    """Работы курса: модули и разделы, по названию похожие на контрольные, экзамены,
+    зачёты и т. п., плюс все задания и тесты. Дата — из Moodle (срок задания/открытие
+    теста), иначе из текста. [{c, k, n, u, d, h, s}]"""
+    items, seen = [], set()
+    sections = {s["num"]: s["name"] for s in info.get("sections", [])}
+
+    def add(kind, name, url, source, mid=None):
+        name = re.sub(r"\s+", " ", name).strip()[:150]
+        key = (kind, name.lower())
+        if not name or key in seen:
+            return
+        seen.add(key)
+        due, has_time = (dated[mid], True) if mid in dated else date_in_text(name, now)
+        items.append({"c": cid, "k": kind, "n": name, "u": url, "d": due, "h": has_time, "s": source})
+
+    for num, name in sections.items():
+        kind = classify(name)
+        if kind and num:
+            add(kind, name, f"{MOODLE_URL}/course/view.php?id={cid}#section-{num}", "раздел")
+    for m in info.get("modules", []):
+        if m["mod"] == "forum":
+            continue
+        kind = classify(m["text"])
+        if not kind and m["mod"] == "quiz":
+            kind = "test"
+        elif not kind and m["mod"] == "assign":
+            kind = "hw"
+        if kind:
+            source = {"label": "объявление", "quiz": "тест", "assign": "задание"}.get(m["mod"], "материал")
+            add(kind, m["text"], m["url"] or f"{MOODLE_URL}/course/view.php?id={cid}#section-{m['section']}",
+                source, m["id"])
+    items.sort(key=lambda x: (x["d"] is None, x["d"] or 0))
+    return items
 
 
 def send_reminders(key, state):
@@ -844,30 +1168,20 @@ def send_reminders(key, state):
     log.info("Группа %s: сработавших напоминаний о дедлайнах: %d", key, len(triggered))
 
 
-def send_files(token, course_name, files, meta, chat_ids, state):
-    """Скачивает новые/обновлённые файлы из Moodle и присылает их документами.
-    Каждый файл загружается в Telegram один раз, остальным уходит по file_id."""
+def send_files(fetcher, course_name, files, chat_ids, state):
+    """Присылает новые/обновлённые файлы документами. Каждый файл загружается
+    в Telegram один раз, остальным уходит по file_id."""
     chat_ids = [c for c in chat_ids if user_wants_files(state, c)]
     if not chat_ids:
         return
     for mid, key in files[:MAX_FILES_PER_COURSE]:
-        info = meta.get(mid, {}).get(key)
         name = key.lstrip("/").split("/")[-1] or "file"
-        if not info or not info["url"]:
-            continue
-        if info["size"] > MAX_FILE_BYTES:
+        info = fetcher.info(mid, key)
+        if info and info["size"] > MAX_FILE_BYTES:
             log.info("Файл %s больше 50 МБ — только ссылка", name)
             continue
-        try:
-            r = requests.get(info["url"], params={"token": token}, timeout=120)
-            r.raise_for_status()
-        except requests.RequestException as e:
-            log.warning("Не удалось скачать %s: %s", name, e)
-            continue
-        if "application/json" in r.headers.get("content-type", ""):
-            log.warning("Moodle не отдал файл %s: %s", name, r.text[:200])
-            continue
-        if len(r.content) > MAX_FILE_BYTES:
+        content = fetcher.get(mid, key)
+        if content is None:
             continue
 
         caption = f"📎 {html.escape(name)}\n{course_name}"[:1000]
@@ -878,7 +1192,7 @@ def send_files(token, course_name, files, meta, chat_ids, state):
                     tg("sendDocument", chat_id=chat_id, document=file_id,
                        caption=caption, parse_mode="HTML")
                 else:
-                    res = tg("sendDocument", files={"document": (name, r.content)},
+                    res = tg("sendDocument", files={"document": (name, content)},
                              chat_id=chat_id, caption=caption, parse_mode="HTML")
                     file_id = res["document"]["file_id"]
             except TelegramError as e:
@@ -891,6 +1205,35 @@ def send_files(token, course_name, files, meta, chat_ids, state):
             except (requests.RequestException, KeyError) as e:
                 log.warning("Не удалось отправить файл %s в %s: %s", name, mask(chat_id), e)
             time.sleep(0.05)
+
+
+def update_prints(course_prints, snapshot, fetcher, backfill):
+    """Обновляет отпечатки файлов курса: для изменённых — из уже скачанного,
+    для ещё не известных — догоняющим сбором в пределах бюджета запуска."""
+    alive = set()
+    for mid, m in snapshot.items():
+        for fkey, modified in m["files"].items():
+            pid = f"{mid}|{fkey}"
+            alive.add(pid)
+            fp = course_prints.get(pid)
+            if fp and fp.get("t") == modified:
+                continue
+            # изменившийся файл обновляем всегда, ещё не известный — в пределах бюджета
+            if not fp and (mid, fkey) not in fetcher.cache:
+                info = fetcher.info(mid, fkey) or {}
+                if (backfill["files"] <= 0 or time.time() > backfill["until"]
+                        or info.get("size", 0) > backfill["bytes"]):
+                    continue
+                backfill["files"] -= 1
+                backfill["bytes"] -= info.get("size", 0)
+            content = fetcher.get(mid, fkey)
+            if content is None:
+                continue
+            new_fp, _ = fingerprint(fkey, content)
+            new_fp["t"] = modified
+            course_prints[pid] = new_fp
+    for pid in [p for p in course_prints if p not in alive]:
+        del course_prints[pid]
 
 
 def check_group(key, group, state):
@@ -911,6 +1254,9 @@ def check_group(key, group, state):
     }
 
     snapshots = state["snapshots"].setdefault(key, {})
+    prints = state["fingerprints"].setdefault(key, {})
+    infos = {}  # id курса -> модули и разделы (для поиска контрольных)
+    backfill = {"files": BACKFILL_FILES, "bytes": BACKFILL_BYTES, "until": time.time() + BACKFILL_SECONDS}
     # курсы, убранные из конфига, забываем
     for old_cid in list(snapshots):
         if int(old_cid) not in course_ids:
@@ -925,13 +1271,34 @@ def check_group(key, group, state):
             log.warning("Группа %s: не удалось получить курс %s: %s", key, cid, e)
             continue
 
+        infos[scid] = meta.pop("_info", {})
+        fetcher = FileFetcher(token, meta)
+        course_prints = prints.setdefault(scid, {})
+
         # новый курс в конфиге: просто запоминаем, без уведомлений
         if scid not in snapshots:
             snapshots[scid] = new
+            update_prints(course_prints, new, fetcher, backfill)
             continue
 
-        changes = find_changes(snapshots[scid], new)
+        old_snapshot = snapshots[scid]
+        changes = find_changes(old_snapshot, new)
         if changes:
+            # что именно поменялось в обновлённых файлах (по сохранённым отпечаткам)
+            details = []
+            for mid, fkey in changed_files(old_snapshot, new):
+                if fkey not in old_snapshot.get(mid, {}).get("files", {}):
+                    continue  # новый файл — сравнивать не с чем
+                old_fp = course_prints.get(f"{mid}|{fkey}")
+                content = fetcher.get(mid, fkey) if old_fp else None
+                if content is None:
+                    continue
+                new_fp, texts = fingerprint(fkey, content)
+                diff = describe_diff(old_fp, new_fp, texts)
+                if diff:
+                    details.append(f"• «{html.escape(fkey.lstrip('/'))}»: {diff}")
+            if details:
+                changes.append("\n🔍 <b>Что изменилось:</b>\n" + "\n".join(details))
             subscribers = [c for c, g in state["subscribers"].items()
                            if g == key and not is_muted(state, c, cid)]
             text = f"<b>{course_name}</b>\n\n" + "\n".join(changes)
@@ -939,16 +1306,26 @@ def check_group(key, group, state):
             for c in [c for c in subscribers if user_wants_digest(state, c)]:
                 state["digest"].setdefault(c, []).append(text)
             subscribers = [c for c in subscribers if not user_wants_digest(state, c)]
-            if not broadcast(subscribers, text, state):
+            if not broadcast(subscribers, text, state, reply_markup=REMIND_TOMORROW):
                 # не доставили никому — оставим старый снимок и попробуем в следующий раз
                 continue
             log.info("Группа %s, курс %s: %d изменений, подписчиков %d",
                      key, cid, len(changes), len(subscribers))
-            send_files(token, course_name, changed_files(snapshots[scid], new), meta,
-                       subscribers, state)
+            send_files(fetcher, course_name, changed_files(old_snapshot, new), subscribers, state)
         snapshots[scid] = new
+        update_prints(course_prints, new, fetcher, backfill)
 
-    state["deadlines"][key] = get_deadlines(token, course_ids, state["deadlines"].get(key, []))
+    dated = {}
+    state["deadlines"][key] = get_deadlines(token, course_ids, state["deadlines"].get(key, []), dated)
+    # контрольные/экзамены: курсы, которые не удалось получить сейчас, берём из прошлого раза
+    old_works = {}
+    for w in state["assessments"].get(key, []):
+        old_works.setdefault(w["c"], []).append(w)
+    now = time.time()
+    state["assessments"][key] = [
+        w for cid in map(str, course_ids)
+        for w in (find_assessments(cid, infos[cid], dated, now) if cid in infos else old_works.get(cid, []))
+    ]
     send_reminders(key, state)
 
 
@@ -966,7 +1343,7 @@ def send_digests(state):
             continue
         title = f"🗞 <b>Сводка за {now:%d.%m}</b>" if user_wants_digest(state, chat_id) \
             else "🗞 <b>Накопленные изменения</b>"
-        if broadcast([chat_id], title + "\n\n" + "\n\n".join(items), state):
+        if broadcast([chat_id], title + "\n\n" + "\n\n".join(items), state, reply_markup=REMIND_TOMORROW):
             state["digest"].pop(chat_id, None)
     if evening:
         state["digest_day"] = today
@@ -974,7 +1351,7 @@ def send_digests(state):
 
 def check_moodle(groups, state):
     # группы, удалённые из конфига, забываем
-    for section in ("snapshots", "course_names", "deadlines", "reminders_sent"):
+    for section in ("snapshots", "course_names", "deadlines", "reminders_sent", "fingerprints", "assessments"):
         for key in list(state[section]):
             if key not in groups:
                 del state[section][key]
