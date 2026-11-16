@@ -25,19 +25,15 @@
   <token_env группы>   — Moodle-токен каждой группы, имя переменной задаётся в groups.json
 """
 
-import difflib
 import hashlib
 import html
-import io
 import json
 import logging
 import os
 import re
 import sys
 import time
-import zipfile
 from datetime import datetime, timedelta, timezone
-from xml.etree import ElementTree
 
 import requests
 
@@ -82,12 +78,6 @@ MAX_FILES_PER_COURSE = 10  # за один запуск, чтобы не зав�
 # сообщением при первой проверке после DIGEST_HOUR по Москве (файлы — ссылками).
 DIGEST_HOUR = 20
 
-# «Что изменилось в файле»: для каждого файла храним хэши страниц/слайдов/абзацев.
-# Для файлов, которые лежали в Moodle до этой функции, отпечатки набираются
-# постепенно — не больше BACKFILL_* за запуск, чтобы не нагружать Moodle.
-BACKFILL_FILES = 8
-BACKFILL_BYTES = 60 * 1024 * 1024
-BACKFILL_SECONDS = 90
 DEADLINES_LIST_DAYS = 14  # сколько дней вперёд показывать в /deadlines
 
 MSK = timezone(timedelta(hours=3))  # время МГУ, без перехода на летнее
@@ -216,130 +206,6 @@ def changed_files(old, new):
     return result
 
 
-# ---------------------------- Что изменилось в файле -------------------
-
-def short_hash(text):
-    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[:10]
-
-
-def _xml_texts(xml_bytes, unit_tag, text_tag):
-    """Тексты блоков (абзацев/слайда) из XML офисного файла, без лишних зависимостей."""
-    root = ElementTree.fromstring(xml_bytes)
-    blocks = []
-    for el in root.iter():
-        if el.tag.endswith("}" + unit_tag):
-            blocks.append("".join(t.text or "" for t in el.iter() if t.tag.endswith("}" + text_tag)))
-    return blocks
-
-
-def fingerprint(name, content):
-    """Отпечаток файла: {"k": вид, "h": [хэши частей], "s": размер} и тексты частей
-    (тексты не храним — только для цитаты в сообщении)."""
-    ext = name.lower().rsplit(".", 1)[-1] if "." in name else ""
-    texts = None
-    try:
-        if ext == "pdf":
-            from pypdf import PdfReader
-            texts = []
-            for page in PdfReader(io.BytesIO(content)).pages:
-                t = (page.extract_text() or "").strip()
-                if not t:  # скан: сравниваем содержимое страницы как есть
-                    data = page.get_contents()
-                    t = "raw:" + hashlib.sha256(data.get_data() if data else b"").hexdigest()
-                texts.append(t)
-        elif ext == "pptx":
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                slides = sorted((n for n in z.namelist() if re.fullmatch(r"ppt/slides/slide\d+\.xml", n)),
-                                key=lambda n: int(re.findall(r"\d+", n)[0]))
-                texts = [" ".join(_xml_texts(z.read(n), "p", "t")).strip() for n in slides]
-        elif ext == "docx":
-            with zipfile.ZipFile(io.BytesIO(content)) as z:
-                texts = [t.strip() for t in _xml_texts(z.read("word/document.xml"), "p", "t") if t.strip()]
-    except Exception as e:  # битый/зашифрованный файл — сравним целиком
-        log.info("Не удалось разобрать %s: %s", name, e)
-        texts = None
-    if texts is None:
-        return {"k": "bin", "h": [short_hash(hashlib.sha256(content).hexdigest())], "s": len(content)}, None
-    kind = {"pdf": "pdf", "pptx": "pptx", "docx": "docx"}[ext]
-    return {"k": kind, "h": [short_hash(t) for t in texts], "s": len(content)}, texts
-
-
-def plural(n, one, few, many):
-    if n % 10 == 1 and n % 100 != 11:
-        return one
-    return few if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else many
-
-
-def ranges(nums):
-    out, start, prev = [], None, None
-    for n in nums:
-        if start is None:
-            start = prev = n
-        elif n == prev + 1:
-            prev = n
-        else:
-            out.append(f"{start}–{prev}" if prev > start else str(start))
-            start = prev = n
-    if start is not None:
-        out.append(f"{start}–{prev}" if prev > start else str(start))
-    return ", ".join(out)
-
-
-def fmt_size(n):
-    return f"{n / 1024 / 1024:.1f} МБ" if n >= 1024 * 1024 else f"{max(1, n // 1024)} КБ"
-
-
-def describe_diff(old, new, texts):
-    """Человеческое описание разницы двух отпечатков (или None, если сказать нечего)."""
-    if old.get("h") == new["h"]:
-        return "содержимое не изменилось — файл просто перезалили"
-    if new["k"] == "bin" or old.get("k") != new["k"]:
-        if not old.get("s"):
-            return None
-        if fmt_size(old["s"]) == fmt_size(new["s"]):
-            return "содержимое изменилось, размер прежний"
-        return f"размер {fmt_size(old['s'])} → {fmt_size(new['s'])}"
-
-    changed, added, removed = [], [], []
-    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, old["h"], new["h"], autojunk=False).get_opcodes():
-        if tag == "replace":
-            # общая часть — изменённые; лишнее в новом — добавленные, в старом — удалённые
-            common = min(i2 - i1, j2 - j1)
-            changed += range(j1 + 1, j1 + common + 1)
-            added += range(j1 + common + 1, j2 + 1)
-            removed += range(i1 + common + 1, i2 + 1)
-        elif tag == "insert":
-            added += range(j1 + 1, j2 + 1)
-        elif tag == "delete":
-            removed += range(i1 + 1, i2 + 1)
-
-    parts = []
-    # глагол в роде и числе: (один м.р., одна ж.р., несколько)
-    verbs = {"ch": ("изменён", "изменена", "изменены"), "add": ("добавлен", "добавлена", "добавлены"),
-             "rm": ("удалён", "удалена", "удалены")}
-    for nums, v in ((changed, "ch"), (added, "add"), (removed, "rm")):
-        if not nums:
-            continue
-        n = len(nums)
-        if new["k"] == "docx":  # номера абзацев ничего не скажут — только количество
-            verb = verbs[v][0] if n % 10 == 1 and n % 100 != 11 else verbs[v][2]
-            parts.append(f"{verb} {n} {plural(n, 'абзац', 'абзаца', 'абзацев')}")
-        elif new["k"] == "pdf":
-            parts.append(f"{verbs[v][1] if n == 1 else verbs[v][2]} {'страница' if n == 1 else 'страницы'} {ranges(nums)}")
-        else:
-            parts.append(f"{verbs[v][0] if n == 1 else verbs[v][2]} {'слайд' if n == 1 else 'слайды'} {ranges(nums)}")
-    if not parts:
-        return None
-    result = ", ".join(parts)
-    # цитата первого изменённого/добавленного места
-    first = (changed or added or [None])[0]
-    if texts and first and first <= len(texts) and not texts[first - 1].startswith("raw:"):
-        quote = re.sub(r"\s+", " ", texts[first - 1]).strip()
-        if quote:
-            result += f"\n      «{html.escape(quote[:120])}{'…' if len(quote) > 120 else ''}»"
-    return result
-
-
 class FileFetcher:
     """Скачивает файлы курса из Moodle не больше одного раза за запуск."""
 
@@ -443,7 +309,6 @@ def empty_state():
         "done": {},          # chat_id -> [id дедлайнов, отмеченных «✅ Сдал»]
         "digest": {},        # chat_id -> [накопленные для сводки сообщения]
         "digest_day": "",    # дата (МСК), за которую сводка уже разослана
-        "fingerprints": {},  # группа -> курс -> "id материала|файл" -> {k, h, s, t}
     }
 
 
@@ -496,7 +361,7 @@ def load_state(groups):
     if raw.get("version") == 2:
         state = empty_state()
         state.update(raw)
-        for gone in ("assessments", "relay_works", "custom", "fired"):  # убранные функции
+        for gone in ("assessments", "relay_works", "custom", "fired", "fingerprints"):  # убранные функции
             state.pop(gone, None)
         for old, new in RENAMED_GROUPS.items():
             for section in ("snapshots", "group_errors"):
@@ -1060,35 +925,6 @@ def send_files(fetcher, course_name, files, chat_ids, state):
             time.sleep(0.05)
 
 
-def update_prints(course_prints, snapshot, fetcher, backfill):
-    """Обновляет отпечатки файлов курса: для изменённых — из уже скачанного,
-    для ещё не известных — догоняющим сбором в пределах бюджета запуска."""
-    alive = set()
-    for mid, m in snapshot.items():
-        for fkey, modified in m["files"].items():
-            pid = f"{mid}|{fkey}"
-            alive.add(pid)
-            fp = course_prints.get(pid)
-            if fp and fp.get("t") == modified:
-                continue
-            # изменившийся файл обновляем всегда, ещё не известный — в пределах бюджета
-            if not fp and (mid, fkey) not in fetcher.cache:
-                info = fetcher.info(mid, fkey) or {}
-                if (backfill["files"] <= 0 or time.time() > backfill["until"]
-                        or info.get("size", 0) > backfill["bytes"]):
-                    continue
-                backfill["files"] -= 1
-                backfill["bytes"] -= info.get("size", 0)
-            content = fetcher.get(mid, fkey)
-            if content is None:
-                continue
-            new_fp, _ = fingerprint(fkey, content)
-            new_fp["t"] = modified
-            course_prints[pid] = new_fp
-    for pid in [p for p in course_prints if p not in alive]:
-        del course_prints[pid]
-
-
 def check_group(key, group, state):
     token = os.getenv(group["token_env"], "").strip()
     if not token:
@@ -1107,8 +943,6 @@ def check_group(key, group, state):
     }
 
     snapshots = state["snapshots"].setdefault(key, {})
-    prints = state["fingerprints"].setdefault(key, {})
-    backfill = {"files": BACKFILL_FILES, "bytes": BACKFILL_BYTES, "until": time.time() + BACKFILL_SECONDS}
     # курсы, убранные из конфига, забываем
     for old_cid in list(snapshots):
         if int(old_cid) not in course_ids:
@@ -1124,32 +958,15 @@ def check_group(key, group, state):
             continue
 
         fetcher = FileFetcher(token, meta)
-        course_prints = prints.setdefault(scid, {})
 
         # новый курс в конфиге: просто запоминаем, без уведомлений
         if scid not in snapshots:
             snapshots[scid] = new
-            update_prints(course_prints, new, fetcher, backfill)
             continue
 
         old_snapshot = snapshots[scid]
         changes = find_changes(old_snapshot, new)
         if changes:
-            # что именно поменялось в обновлённых файлах (по сохранённым отпечаткам)
-            details = []
-            for mid, fkey in changed_files(old_snapshot, new):
-                if fkey not in old_snapshot.get(mid, {}).get("files", {}):
-                    continue  # новый файл — сравнивать не с чем
-                old_fp = course_prints.get(f"{mid}|{fkey}")
-                content = fetcher.get(mid, fkey) if old_fp else None
-                if content is None:
-                    continue
-                new_fp, texts = fingerprint(fkey, content)
-                diff = describe_diff(old_fp, new_fp, texts)
-                if diff:
-                    details.append(f"• «{html.escape(fkey.lstrip('/'))}»: {diff}")
-            if details:
-                changes.append("\n🔍 <b>Что изменилось:</b>\n" + "\n".join(details))
             subscribers = [c for c, g in state["subscribers"].items()
                            if g == key and not is_muted(state, c, cid)]
             text = f"<b>{course_name}</b>\n\n" + "\n".join(changes)
@@ -1164,7 +981,6 @@ def check_group(key, group, state):
                      key, cid, len(changes), len(subscribers))
             send_files(fetcher, course_name, changed_files(old_snapshot, new), subscribers, state)
         snapshots[scid] = new
-        update_prints(course_prints, new, fetcher, backfill)
 
     state["deadlines"][key] = get_deadlines(token, course_ids, state["deadlines"].get(key, []))
     send_reminders(key, state)
@@ -1192,7 +1008,7 @@ def send_digests(state):
 
 def check_moodle(groups, state):
     # группы, удалённые из конфига, забываем
-    for section in ("snapshots", "course_names", "deadlines", "reminders_sent", "fingerprints"):
+    for section in ("snapshots", "course_names", "deadlines", "reminders_sent"):
         for key in list(state[section]):
             if key not in groups:
                 del state[section][key]
