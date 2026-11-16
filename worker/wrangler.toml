@@ -1,0 +1,20 @@
+# Cloudflare Worker — ретранслятор Telegram-бота.
+# Разворачивается workflow .github/workflows/deploy-worker.yml.
+# Адрес: https://moodle-bot-relay.econ-msu-bot.workers.dev
+name = "moodle-bot-relay"
+account_id = "b4dfe2e32e0851fdb7fc1436993a3d3f"
+main = "src/index.js"
+compatibility_date = "2025-01-01"
+workers_dev = true
+
+[[kv_namespaces]]
+binding = "BOT_KV"
+id = "c209fda4d2ae468780e0bcf5646bc3b2"
+
+# Логи Worker в дашборде Cloudflare (Workers -> moodle-bot-relay -> Logs)
+[observability]
+enabled = true
+
+# Сторож: раз в 30 минут проверяет, что бот присылает отчёты о проверках Moodle
+[triggers]
+crons = ["*/30 * * * *"]

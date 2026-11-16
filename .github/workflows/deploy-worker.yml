@@ -1,0 +1,50 @@
+name: Deploy relay worker
+
+# Разворачивает Cloudflare Worker (папка worker/) при изменениях в ней
+# или вручную: Actions -> Deploy relay worker -> Run workflow.
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "worker/**"
+      - ".github/workflows/deploy-worker.yml"
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check Cloudflare secrets
+        id: check
+        env:
+          CF_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          SYNC: ${{ secrets.BOT_SYNC_SECRET }}
+        run: |
+          missing=""
+          [ -n "$CF_TOKEN" ]   || missing="$missing CLOUDFLARE_API_TOKEN"
+          [ -n "$SYNC" ]       || missing="$missing BOT_SYNC_SECRET"
+          if [ -n "$missing" ]; then
+            echo "::warning::Worker не развёрнут, не заданы секреты:$missing"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout repository
+        if: steps.check.outputs.ready == 'true'
+        uses: actions/checkout@v4
+
+      - name: Deploy worker
+        if: steps.check.outputs.ready == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          workingDirectory: worker
+          secrets: |
+            TELEGRAM_BOT_TOKEN
+            BOT_SYNC_SECRET
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          BOT_SYNC_SECRET: ${{ secrets.BOT_SYNC_SECRET }}

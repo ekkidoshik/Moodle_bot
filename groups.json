@@ -1,0 +1,24 @@
+{
+  "groups": {
+    "m104": {
+      "title": "М104",
+      "token_env": "MOODLE_TOKEN",
+      "courses": [697, 698, 699, 700, 702, 703, 704, 753, 984]
+    },
+    "m105": {
+      "title": "М105",
+      "token_env": "MOODLE_TOKEN_M105",
+      "courses": []
+    },
+    "e207": {
+      "title": "Экономика 2й курс 1й поток",
+      "token_env": "MOODLE_TOKEN_E207",
+      "courses": []
+    },
+    "ezhobad": {
+      "title": "маша дабоже э204",
+      "token_env": "MOODLE_TOKEN_EZHOBAD",
+      "courses": []
+    }
+  }
+}

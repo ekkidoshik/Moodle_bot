@@ -1,0 +1,53 @@
+name: Moodle Telegram Bot
+
+# Запускается внешним cron-job раз в 15 минут через workflow_dispatch.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Запуски идут строго по одному: иначе два прогона одновременно прочитают
+# один и тот же offset Telegram и state.json.
+concurrency:
+  group: moodle-bot-check
+  cancel-in-progress: false
+
+jobs:
+  check-moodle:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Handle Telegram commands and check Moodle
+        env:
+          MOODLE_URL: ${{ secrets.MOODLE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          ADMIN_CHAT_ID: ${{ secrets.ADMIN_CHAT_ID }}
+          # Cloudflare Worker (папка worker/): отвечает в Telegram и хранит состояние бота.
+          # Без BOT_SYNC_SECRET бот читает сообщения сам, но состояние между запусками
+          # не сохраняется — оставлять так надолго нельзя.
+          RELAY_URL: https://moodle-bot-relay.econ-msu-bot.workers.dev
+          BOT_SYNC_SECRET: ${{ secrets.BOT_SYNC_SECRET }}
+          GROUPS_FILE: groups.json
+          # состояние хранится в Cloudflare KV (через Worker); локальный файл — временный
+          STATE_FILE: state.json
+          # Moodle-токены групп. Имя переменной = token_env группы в groups.json.
+          # Добавляя группу, добавь сюда строку с её секретом.
+          MOODLE_TOKEN: ${{ secrets.MOODLE_TOKEN }}            # М104
+          MOODLE_TOKEN_M105: ${{ secrets.MOODLE_TOKEN_M105 }}
+          MOODLE_TOKEN_E207: ${{ secrets.MOODLE_TOKEN_E207 }}
+          MOODLE_TOKEN_EZHOBAD: ${{ secrets.MOODLE_TOKEN_EZHOBAD }}
+        run: python moodle_bot.py
