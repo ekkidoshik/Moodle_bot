@@ -348,6 +348,41 @@ function itemLink(item) {
   return /^https?:\/\//i.test(item.u || "") ? `<a href="${esc(item.u)}">${name}</a>` : name;
 }
 
+function materialSaveRows(materials) {
+  return materials.filter((m) => m.id && m.u)
+    .map((m) => [{ ...saveButton(`m:${m.id}`), text: `⭐ ${m.n.slice(0, 40)}` }]);
+}
+
+async function courseMaterials(env, catalog, key, chatId, cid, page, filter) {
+  const index = (await env.BOT_KV.get(`index:${key}`, "json")) || [];
+  const query = { ktp: "ктп", brs: "брс" }[filter];
+  const materials = index.filter((m) => m.c === cid &&
+    (!query || norm([m.n, ...(m.f || [])].join(" ")).includes(query)))
+    .sort((a, b) => Number(a.id || 0) - Number(b.id || 0));
+  const pageSize = 8;
+  const last = Math.max(0, Math.ceil(materials.length / pageSize) - 1);
+  const current = Math.min(page, last);
+  const shown = materials.slice(current * pageSize, (current + 1) * pageSize);
+  const title = query ? query.toUpperCase() : "Все материалы";
+  const name = esc(catalog.course_names[key][cid].slice(0, 180));
+  const lines = shown.map((m) => {
+    const filenames = (m.f || []).slice(0, 2).map((file) => esc(file.slice(0, 85)));
+    return `• ${itemLink(m)}` + (filenames.length ? `\n   📎 ${filenames.join(", ")}` : "");
+  });
+  const rows = materialSaveRows(shown);
+  const nav = [];
+  if (current > 0) nav.push({ text: "← Назад", callback_data: `materials:${cid}:${filter}:${current - 1}` });
+  if (current < last) nav.push({ text: "Далее →", callback_data: `materials:${cid}:${filter}:${current + 1}` });
+  if (nav.length) rows.push(nav);
+  rows.push([
+    { text: "Все", callback_data: `materials:${cid}:all:0` },
+    { text: "КТП", callback_data: `materials:${cid}:ktp:0` },
+    { text: "БРС", callback_data: `materials:${cid}:brs:0` },
+  ], [{ text: "К папке курса", callback_data: `course:${cid}` }]);
+  return send(env, chatId, `📂 <b>${name} · ${title}</b> · ${current + 1}/${last + 1}\n\n` +
+    (lines.join("\n\n") || "Материалы не найдены."), { reply_markup: { inline_keyboard: rows } });
+}
+
 async function courseFolder(env, catalog, key, chatId, cid) {
   const name = (catalog.course_names[key] || {})[cid];
   const base = catalog.moodle_url || "https://on2026.econ.msu.ru";
@@ -371,8 +406,8 @@ async function courseFolder(env, catalog, key, chatId, cid) {
   const rows = [
     [{ text: "Открыть курс в Moodle", url: `${base}/course/view.php?id=${cid}` }],
     ...deadlines.map((d) => [{ ...saveButton(d.id), text: `⭐ ${d.name.slice(0, 40)}` }]),
-    ...materials.filter((m) => m.id && m.u)
-      .map((m) => [{ ...saveButton(`m:${m.id}`), text: `⭐ ${m.n.slice(0, 40)}` }]),
+    [{ text: "Все материалы", callback_data: `materials:${cid}:all:0` }],
+    ...materialSaveRows(materials),
   ];
   return send(env, chatId, text, { reply_markup: { inline_keyboard: rows } });
 }
@@ -740,6 +775,14 @@ async function handleCallback(cq, catalog, env) {
     if (!catalog.course_names[key]?.[folder[1]]) return answer("Откройте актуальный список курсов");
     await answer();
     return courseFolder(env, catalog, key, chatId, folder[1]);
+  }
+  const materials = data.match(/^materials:(\d+):(all|ktp|brs):(\d+)$/);
+  if (materials) {
+    const [, cid, filter, page] = materials;
+    const key = sub?.g;
+    if (!catalog.course_names[key]?.[cid]) return answer("Откройте актуальный список курсов");
+    await answer();
+    return courseMaterials(env, catalog, key, chatId, cid, Number(page), filter);
   }
   const save = data.match(/^sv:((?:m|assign|quiz):\d+)$/);
   if (save) {
