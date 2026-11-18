@@ -28,6 +28,7 @@
 
 const BTN_COURSES = "📚 Мои курсы";
 const BTN_DEADLINES = "⏰ Дедлайны";
+const BTN_SAVED = "⭐ Избранное";
 const BTN_SETTINGS = "⚙️ Настройки";
 const REMINDER_OPTIONS = [[259200, "за 3 дня"], [86400, "за сутки"], [10800, "за 3 часа"], [3600, "за 1 час"]];
 const DEFAULT_REMINDERS = [86400, 10800];
@@ -276,7 +277,7 @@ function groupsKeyboard(catalog, current) {
   const rows = [];
   for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
   rows.push([{ text: BTN_COURSES }, { text: BTN_DEADLINES }]);
-  rows.push([{ text: BTN_SETTINGS }]);
+  rows.push([{ text: BTN_SETTINGS }, { text: BTN_SAVED }]);
   return { keyboard: rows, resize_keyboard: true, is_persistent: true, input_field_placeholder: "Выберите группу" };
 }
 
@@ -318,7 +319,10 @@ function coursesKeyboard(catalog, key, muted) {
   const names = catalog.course_names[key] || {};
   const rows = Object.entries(names)
     .sort((a, b) => a[1].localeCompare(b[1], "ru"))
-    .map(([cid, name]) => [{ text: `${muted.includes(cid) ? "🔕" : "🔔"} ${name}`, callback_data: `c:${cid}` }]);
+    .map(([cid, name]) => [
+      { text: `📂 ${name.slice(0, 48)}`, callback_data: `course:${cid}` },
+      { text: muted.includes(cid) ? "🔕" : "🔔", callback_data: `c:${cid}` },
+    ]);
   return { inline_keyboard: rows };
 }
 
@@ -328,11 +332,93 @@ function coursesText(catalog, key) {
     return `Курсы группы <b>${esc(groupTitle(catalog, key))}</b> появятся после ближайшей проверки Moodle (до ${checkEvery(catalog)} минут).`;
   }
   return (`📚 Курсы группы <b>${esc(groupTitle(catalog, key))}</b>.\n\n` +
-    "Нажмите на курс, чтобы отключить 🔕 или включить 🔔 по нему уведомления о файлах и дедлайнах.");
+    "Нажмите на название, чтобы открыть папку курса. Колокольчик управляет уведомлениями.");
 }
 
 function doneButton(d, isDone) {
   return [{ text: `${isDone ? "↩️ Не сдал" : "✅ Сдал"}: ${d.name.slice(0, 40)}`, callback_data: `d:${d.id}` }];
+}
+
+function saveButton(id) {
+  return { text: "⭐ Сохранить", callback_data: `sv:${id}` };
+}
+
+function itemLink(item) {
+  const name = esc(item.n.slice(0, 100));
+  return /^https?:\/\//i.test(item.u || "") ? `<a href="${esc(item.u)}">${name}</a>` : name;
+}
+
+async function courseFolder(env, catalog, key, chatId, cid) {
+  const name = (catalog.course_names[key] || {})[cid];
+  const base = catalog.moodle_url || "https://on2026.econ.msu.ru";
+  const [index, done] = await Promise.all([
+    env.BOT_KV.get(`index:${key}`, "json"),
+    getDone(env, chatId),
+  ]);
+  const deadlines = (catalog.deadlines[key] || [])
+    .filter((d) => d.course === cid && d.due > Date.now() / 1000 && !done.includes(d.id))
+    .sort((a, b) => a.due - b.due).slice(0, 5);
+  const materials = (index || []).filter((m) => m.c === cid)
+    .sort((a, b) => (b.t || 0) - (a.t || 0) || Number(b.id || 0) - Number(a.id || 0))
+    .slice(0, 5);
+  const deadlineLines = deadlines.map((d) => `• ${itemLink({ n: d.name, u: d.url })} · ${fmtTime(d.due)}`);
+  const materialLines = materials.map((m) => `• ${itemLink(m)}`);
+  const text = [
+    `📂 <b>${esc(name.slice(0, 180))}</b>`,
+    `<b>Ближайшие дедлайны</b>\n${deadlineLines.join("\n") || "Нет несданных дедлайнов"}`,
+    `<b>Последние материалы</b>\n${materialLines.join("\n") || "Материалов пока нет"}`,
+  ].join("\n\n");
+  const rows = [
+    [{ text: "Открыть курс в Moodle", url: `${base}/course/view.php?id=${cid}` }],
+    ...deadlines.map((d) => [{ ...saveButton(d.id), text: `⭐ ${d.name.slice(0, 40)}` }]),
+    ...materials.filter((m) => m.id && m.u)
+      .map((m) => [{ ...saveButton(`m:${m.id}`), text: `⭐ ${m.n.slice(0, 40)}` }]),
+  ];
+  return send(env, chatId, text, { reply_markup: { inline_keyboard: rows } });
+}
+
+async function savedMessage(env, chatId, page) {
+  const prefix = `saved:${chatId}:`;
+  const { keys } = await env.BOT_KV.list({ prefix });
+  if (!keys.length) {
+    return send(env, chatId, "⭐ Избранное пусто. Нажмите ⭐ под уведомлением или в папке курса, чтобы сохранить ссылку.");
+  }
+  const pageSize = 8;
+  const lastPage = Math.ceil(keys.length / pageSize) - 1;
+  const current = Math.min(page, lastPage);
+  const items = await Promise.all(keys.slice(current * pageSize, (current + 1) * pageSize)
+    .map(async ({ name, metadata }) => ({ name, item: metadata || await env.BOT_KV.get(name, "json") })));
+  const available = items.filter(({ item }) => item);
+  const lines = available.map(({ item }) => `• ${itemLink(item)}\n  ${esc(item.course.slice(0, 100))}`);
+  const rows = available.map(({ name, item }) => [
+    { text: `✕ ${item.n.slice(0, 40)}`, callback_data: `rm:${name.slice(prefix.length)}` },
+  ]);
+  const nav = [];
+  if (current) nav.push({ text: "← Назад", callback_data: `saved:${current - 1}` });
+  if (current < lastPage) nav.push({ text: "Далее →", callback_data: `saved:${current + 1}` });
+  if (nav.length) rows.push(nav);
+  return send(env, chatId, `⭐ <b>Избранное</b> · ${current + 1}/${lastPage + 1}\n\n${lines.join("\n\n")}`,
+    { reply_markup: { inline_keyboard: rows } });
+}
+
+async function saveItem(env, catalog, chatId, key, id) {
+  const names = catalog.course_names[key] || {};
+  let item;
+  if (id.startsWith("m:")) {
+    const index = (await env.BOT_KV.get(`index:${key}`, "json")) || [];
+    item = index.find((m) => m.id === id.slice(2));
+  } else {
+    const deadline = (catalog.deadlines[key] || []).find((d) => d.id === id);
+    if (deadline) item = { n: deadline.name, u: deadline.url, c: deadline.course };
+  }
+  if (!item || !names[item.c] || !/^https?:\/\//i.test(item.u || "")) return false;
+  const storageKey = `saved:${chatId}:${id}`;
+  if (await env.BOT_KV.get(storageKey)) return true;
+  const metadata = { n: item.n.slice(0, 150), u: item.u, course: names[item.c].slice(0, 100) };
+  const value = JSON.stringify(metadata);
+  const options = new TextEncoder().encode(value).length <= 1024 ? { metadata } : {};
+  await env.BOT_KV.put(storageKey, value, options);
+  return true;
 }
 
 function deadlinesMessage(catalog, key, muted, done) {
@@ -352,7 +438,7 @@ function deadlinesMessage(catalog, key, muted, done) {
   return {
     text: `⏰ Дедлайны на ближайшие ${DEADLINES_LIST_DAYS} дней:\n\n` + lines.join("\n\n") +
       "\n\nОтметьте сданное — напоминаний о нём больше не будет." + footer,
-    markup: { inline_keyboard: items.slice(0, 10).map((d) => doneButton(d, done.includes(d.id))) },
+    markup: { inline_keyboard: items.slice(0, 10).map((d) => [...doneButton(d, done.includes(d.id)), saveButton(d.id)]) },
   };
 }
 
@@ -589,6 +675,7 @@ async function handleMessage(msg, catalog, env) {
     const dm = deadlinesMessage(catalog, current, muted, await getDone(env, chatId));
     return send(env, chatId, dm.text, dm.markup ? { reply_markup: dm.markup } : {});
   }
+  if (command === "/saved" || text === BTN_SAVED) return savedMessage(env, chatId, 0);
   if (command === "/settings" || text === BTN_SETTINGS) {
     if (!current) return send(env, chatId, "Сначала выберите группу: /start");
     return send(env, chatId, settingsText(), { reply_markup: settingsKeyboard(sub) });
@@ -646,6 +733,30 @@ async function handleCallback(cq, catalog, env) {
 
   const chatId = String(msg.chat.id);
   const sub = await getSub(env, chatId);
+
+  const folder = data.match(/^course:(\d+)$/);
+  if (folder) {
+    const key = sub?.g;
+    if (!catalog.course_names[key]?.[folder[1]]) return answer("Откройте актуальный список курсов");
+    await answer();
+    return courseFolder(env, catalog, key, chatId, folder[1]);
+  }
+  const save = data.match(/^sv:((?:m|assign|quiz):\d+)$/);
+  if (save) {
+    if (!sub || !catalog.groups.some((g) => g.key === sub.g)) return answer("Сначала выберите группу: /start");
+    const ok = await saveItem(env, catalog, chatId, sub.g, save[1]);
+    return answer(ok ? "⭐ Сохранено в избранном" : "Ссылка недоступна в каталоге группы. Если уведомление новое, попробуйте ещё раз через минуту.");
+  }
+  const page = data.match(/^saved:(\d+)$/);
+  if (page) {
+    await answer();
+    return savedMessage(env, chatId, Number(page[1]));
+  }
+  const remove = data.match(/^rm:((?:m|assign|quiz):\d+)$/);
+  if (remove) {
+    await env.BOT_KV.delete(`saved:${chatId}:${remove[1]}`);
+    return answer("Удалено из избранного. Обновить список — /saved");
+  }
 
   if (data.startsWith("g:")) {
     // inline-кнопки групп из старых сообщений бота

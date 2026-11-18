@@ -169,7 +169,7 @@ def get_snapshot(token, course_id):
     return snapshot, meta
 
 
-def find_changes(old, new):
+def find_changes(old, new, changed_ids=None):
     """Сравнивает старое и новое состояние курса, возвращает список строк."""
     changes = []
     for mid, m in new.items():
@@ -177,7 +177,10 @@ def find_changes(old, new):
         title = html.escape(m["name"])
         name_html = f'<a href="{link}">{title}</a>' if m["url"] else title
 
+        previous_count = len(changes)
         if mid not in old:
+            if changed_ids is not None:
+                changed_ids.append(mid)
             line = f"🆕 Новый материал: {name_html}"
             if m["files"]:
                 names = ", ".join(html.escape(k.lstrip("/")) for k in m["files"])
@@ -192,6 +195,8 @@ def find_changes(old, new):
                 changes.append(f"📎 Новый файл «{shown}» в материале {name_html}")
             elif modified != old_files[key]:
                 changes.append(f"✏️ Обновлён файл «{shown}» в материале {name_html}")
+        if changed_ids is not None and len(changes) != previous_count:
+            changed_ids.append(mid)
     return changes
 
 
@@ -415,6 +420,8 @@ def setup_bot_profile(groups, state):
         {"command": "calendar", "description": "Дедлайны в календаре телефона"},
         {"command": "stop", "description": "Отписаться от уведомлений"},
     ]
+    if relay_enabled():
+        commands.insert(-1, {"command": "saved", "description": "Избранное"})
     description = (
         "Присылаю новые и обновлённые файлы из курсов Moodle вашей группы, напоминаю "
         "о дедлайнах, ищу материалы по курсам и добавляю сроки в календарь.\n\n"
@@ -745,6 +752,7 @@ def push_to_relay(groups, state):
         "deadlines": {k: state["deadlines"].get(k, []) for k in groups},
         "admin": ADMIN_CHAT_ID,  # /stats и /broadcast в Worker — только этому чату
         "check_every": CHECK_EVERY_MIN,
+        "moodle_url": MOODLE_URL.rstrip("/"),
     }
     signature = hashlib.sha256(
         json.dumps(catalog, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
@@ -757,7 +765,8 @@ def push_to_relay(groups, state):
     sent_index = state.setdefault("relay_index", {})
     for key in groups:
         index = [
-            {"c": cid, "n": m["name"], "u": m["url"],
+            {"c": cid, "id": mid, "n": m["name"], "u": m["url"],
+             "t": m.get("updated") or max(m["files"].values(), default=0),
              "f": [f.lstrip("/") for f in m["files"]]}
             for cid, course in sorted(state["snapshots"].get(key, {}).items())
             for mid, m in sorted(course.items())
@@ -842,6 +851,11 @@ def get_deadlines(token, course_ids, old):
     return [d for d in items if d["due"] > now and d["course"] in allowed]
 
 
+def material_save_buttons(materials):
+    return [[{"text": f"⭐ {name[:40]}", "callback_data": f"sv:m:{mid}"}]
+            for mid, name in materials[:10]]
+
+
 def send_reminders(key, state):
     """Напоминания о дедлайнах. Для каждого окна (3 дня, сутки, 3 ч, 1 ч) дедлайн
     «срабатывает» один раз; подписчик получает его, если выбрал хотя бы одно из
@@ -882,11 +896,14 @@ def send_reminders(key, state):
         # «✅ Сдал» обрабатывает Worker: больше не напоминать об этом задании
         buttons = [[{"text": f"✅ Сдал: {d['name'][:40]}", "callback_data": f"d:{d['id']}"}]
                    for d in mine[:10]]
+        if relay_enabled():
+            for row, d in zip(buttons, mine):
+                row.append({"text": "⭐ Сохранить", "callback_data": f"sv:{d['id']}"})
         broadcast([chat_id], text, state, reply_markup={"inline_keyboard": buttons})
     log.info("Группа %s: сработавших напоминаний о дедлайнах: %d", key, len(triggered))
 
 
-def send_files(fetcher, course_name, files, chat_ids, state):
+def send_files(fetcher, course_name, files, chat_ids, state, materials=None):
     """Присылает новые/обновлённые файлы документами. Каждый файл загружается
     в Telegram один раз, остальным уходит по file_id."""
     chat_ids = [c for c in chat_ids if user_wants_files(state, c)]
@@ -903,15 +920,22 @@ def send_files(fetcher, course_name, files, chat_ids, state):
             continue
 
         caption = f"📎 {html.escape(name)}\n{course_name}"[:1000]
+        material = (materials or {}).get(mid)
+        extra = {}
+        if material and material["url"]:
+            extra["reply_markup"] = {"inline_keyboard": [
+                [{"text": "⭐ Сохранить материал", "callback_data": f"sv:m:{mid}"}]
+            ]}
+        upload_extra = {"reply_markup": json.dumps(extra["reply_markup"])} if extra else {}
         file_id = None
         for chat_id in chat_ids:
             try:
                 if file_id:
                     tg("sendDocument", chat_id=chat_id, document=file_id,
-                       caption=caption, parse_mode="HTML")
+                       caption=caption, parse_mode="HTML", **extra)
                 else:
                     res = tg("sendDocument", files={"document": (name, content)},
-                             chat_id=chat_id, caption=caption, parse_mode="HTML")
+                             chat_id=chat_id, caption=caption, parse_mode="HTML", **upload_extra)
                     file_id = res["document"]["file_id"]
             except TelegramError as e:
                 if chat_is_gone(e):
@@ -965,21 +989,34 @@ def check_group(key, group, state):
             continue
 
         old_snapshot = snapshots[scid]
-        changes = find_changes(old_snapshot, new)
+        changed_ids = []
+        changes = find_changes(old_snapshot, new, changed_ids)
+        for mid, material in new.items():
+            previous_update = old_snapshot.get(mid, {}).get("updated")
+            if previous_update:
+                material["updated"] = previous_update
+        updated_at = int(time.time())
+        for mid in changed_ids:
+            new[mid]["updated"] = updated_at
         if changes:
             subscribers = [c for c, g in state["subscribers"].items()
                            if g == key and not is_muted(state, c, cid)]
             text = f"<b>{course_name}</b>\n\n" + "\n".join(changes)
+            materials = [(mid, new[mid]["name"]) for mid in changed_ids if new[mid]["url"]]
+            buttons = material_save_buttons(materials) if relay_enabled() else []
+            extra = {"reply_markup": {"inline_keyboard": buttons}} if buttons else {}
             # у кого включена сводка — копим до вечера, остальным сразу
             for c in [c for c in subscribers if user_wants_digest(state, c)]:
-                state["digest"].setdefault(c, []).append(text)
+                state["digest"].setdefault(c, []).append(
+                    {"text": text, "materials": materials[:10]} if buttons else text)
             subscribers = [c for c in subscribers if not user_wants_digest(state, c)]
-            if not broadcast(subscribers, text, state):
+            if not broadcast(subscribers, text, state, **extra):
                 # не доставили никому — оставим старый снимок и попробуем в следующий раз
                 continue
             log.info("Группа %s, курс %s: %d изменений, подписчиков %d",
                      key, cid, len(changes), len(subscribers))
-            send_files(fetcher, course_name, changed_files(old_snapshot, new), subscribers, state)
+            send_files(fetcher, course_name, changed_files(old_snapshot, new), subscribers, state,
+                       new if relay_enabled() else None)
         snapshots[scid] = new
 
     state["deadlines"][key] = get_deadlines(token, course_ids, state["deadlines"].get(key, []))
@@ -1000,7 +1037,15 @@ def send_digests(state):
             continue
         title = f"🗞 <b>Сводка за {now:%d.%m}</b>" if user_wants_digest(state, chat_id) \
             else "🗞 <b>Накопленные изменения</b>"
-        if broadcast([chat_id], title + "\n\n" + "\n\n".join(items), state):
+        texts = [item["text"] if isinstance(item, dict) else item for item in items]
+        materials = {}
+        if relay_enabled():
+            for item in items:
+                if isinstance(item, dict):
+                    materials.update(item["materials"])
+        buttons = material_save_buttons(list(materials.items()))
+        extra = {"reply_markup": {"inline_keyboard": buttons}} if buttons else {}
+        if broadcast([chat_id], title + "\n\n" + "\n\n".join(texts), state, **extra):
             state["digest"].pop(chat_id, None)
     if evening:
         state["digest_day"] = today
