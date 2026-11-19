@@ -828,7 +828,8 @@ async function handleCallback(cq, catalog, env) {
         console.log("Не удалось записать запрос на файл:", e.message);
         return answer("Не удалось запросить файл. Попробуйте позже.");
       }
-      return answer("Бот отправит файл при ближайшей проверке Moodle.");
+      await answer();
+      return send(env, chatId, "Бот отправит файл в течение 5 минут.");
     }
     const rows = files.slice(offset, offset + 8).map((path, i) => [
       { text: `📎 ${path.split("/").pop().slice(0, 60)}`, callback_data: `file:${cid}:${mid}:${offset + i}` },
