@@ -64,6 +64,7 @@ RESERVED_COMMANDS = {"start", "stop", "courses", "deadlines", "search", "setting
                      "stats", "broadcast", "calendar", "id"}
 BTN_COURSES = "📚 Мои курсы"
 BTN_DEADLINES = "⏰ Дедлайны"
+BTN_SETTINGS = "⚙️ Настройки"
 
 # Напоминания о дедлайнах: за сколько секунд до срока. Каждый подписчик выбирает
 # свои окна в «⚙️ Настройках» (хранятся в Worker); по умолчанию — сутки и 3 часа.
@@ -128,8 +129,11 @@ def load_groups():
 
 # ---------------------------- Moodle ----------------------------------
 
+MOODLE_CONNECT_ERROR = "Не удалось подключиться к Moodle после трёх попыток"
+
+
 def moodle(token, function, **params):
-    """Один запрос к официальному API Moodle."""
+    """Запрос к API Moodle с повторами при таймауте подключения."""
     data = {
         "wstoken": token,
         "wsfunction": function,
@@ -137,7 +141,15 @@ def moodle(token, function, **params):
     }
     data.update(params)
     # токен отправляем в теле запроса, а не в ссылке
-    r = requests.post(f"{MOODLE_URL}/webservice/rest/server.php", data=data, timeout=30)
+    url = f"{MOODLE_URL}/webservice/rest/server.php"
+    for delay in (1, 2):
+        try:
+            r = requests.post(url, data=data, timeout=(10, 30))
+            break
+        except requests.exceptions.ConnectTimeout:
+            time.sleep(delay)
+    else:
+        r = requests.post(url, data=data, timeout=(10, 30))
     r.raise_for_status()
     result = r.json()
     if isinstance(result, dict) and "exception" in result:
@@ -398,25 +410,18 @@ def save_state(state):
 
 # ----------------------- Команды и кнопки ------------------------------
 #
-# Без Worker бот просыпается раз в CHECK_EVERY_MIN минут, поэтому выбор группы сделан так, чтобы
-# нажатие срабатывало сразу на стороне Telegram, без ответа бота:
-#   - меню команд (/m104, /e207, ...) видно ещё до /start — его ставит setMyCommands;
-#   - обычная (reply) клавиатура с названиями групп: нажатие сразу отправляет
-#     сообщение, а группа привязывается при следующем запуске.
-
 def relay_enabled():
     return bool(RELAY_URL and BOT_SYNC_SECRET)
 
 
 def setup_bot_profile(groups, state):
     """Меню команд и описание бота. Отправляем в Telegram, только если что-то изменилось."""
-    commands = [{"command": "start", "description": "Выбрать группу"}]
-    commands += [{"command": key, "description": f"Группа {g['title']}"} for key, g in groups.items()]
-    commands += [
+    commands = [
+        {"command": "start", "description": "Открыть меню бота"},
         {"command": "courses", "description": "Мои курсы и отключение ненужных"},
         {"command": "deadlines", "description": "Ближайшие дедлайны"},
         {"command": "search", "description": "Поиск по материалам курсов"},
-        {"command": "settings", "description": "Напоминания, файлы, сводка"},
+        {"command": "settings", "description": "Группа, напоминания, файлы и сводка" if relay_enabled() else "Смена группы"},
         {"command": "calendar", "description": "Дедлайны в календаре телефона"},
         {"command": "stop", "description": "Отписаться от уведомлений"},
     ]
@@ -425,14 +430,14 @@ def setup_bot_profile(groups, state):
     description = (
         "Присылаю новые и обновлённые файлы из курсов Moodle вашей группы, напоминаю "
         "о дедлайнах, ищу материалы по курсам и добавляю сроки в календарь.\n\n"
-        "Нажмите «Начать» и выберите группу на клавиатуре или в меню. "
+        "Нажмите «Начать» и выберите свою группу. "
     )
     if relay_enabled():
         description += f"Бот отвечает сразу, а Moodle проверяет каждые {CHECK_EVERY_MIN} минут."
     else:
         description += (f"Бот читает сообщения раз в {CHECK_EVERY_MIN} минут, поэтому "
-                        "подтверждение придёт не сразу — выбор при этом уже сохранён.")
-    short = "Новые файлы, дедлайны и поиск по Moodle вашей группы. Выберите группу в меню."
+                        "подтверждение придёт при следующей проверке.")
+    short = "Новые файлы, дедлайны и поиск по Moodle вашей группы. Нажмите «Начать»."
 
     signature = json.dumps([commands, description, short], ensure_ascii=False, sort_keys=True)
     if state.get("bot_profile") == signature:
@@ -449,12 +454,20 @@ def setup_bot_profile(groups, state):
 
 
 def groups_keyboard(groups, current=None):
-    buttons = [{"text": ("✅ " if key == current else "") + g["title"]}
-               for key, g in groups.items()]
-    rows = [buttons[i:i + 2] for i in range(0, len(buttons), 2)]
-    rows.append([{"text": BTN_COURSES}, {"text": BTN_DEADLINES}])
-    return {"keyboard": rows, "resize_keyboard": True, "is_persistent": True,
-            "input_field_placeholder": "Выберите группу"}
+    buttons = [
+        {"text": ("✅ " if key == current else "") + g["title"],
+         "callback_data": CALLBACK_PREFIX + key}
+        for key, g in groups.items()
+    ]
+    return {"inline_keyboard": [buttons[i:i + 2] for i in range(0, len(buttons), 2)]}
+
+
+def main_keyboard():
+    return {
+        "keyboard": [[{"text": BTN_COURSES}, {"text": BTN_DEADLINES}], [{"text": BTN_SETTINGS}]],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
 
 
 def find_group(text, groups):
@@ -480,8 +493,8 @@ def subscribe(chat_id, key, groups, state):
         "Буду присылать новые и обновлённые файлы из её курсов и напоминать "
         f"о дедлайнах (проверка каждые {CHECK_EVERY_MIN} минут).\n\n"
         f"{BTN_COURSES} — список курсов, ненужные можно отключить.\n"
-        "Сменить группу — кнопкой внизу, /stop — отписаться.",
-        reply_markup=groups_keyboard(groups, key),
+        "Сменить группу можно в настройках. /stop — отписаться.",
+        reply_markup=main_keyboard(),
     )
 
 
@@ -580,15 +593,21 @@ def handle_message(msg, groups, state):
     current = state["subscribers"].get(chat_id)
 
     if command == "/start":
-        intro = "Выберите свою группу на клавиатуре внизу — буду присылать новые файлы из её курсов Moodle."
         if current in groups:
-            intro = (f"Сейчас вы подписаны на группу <b>{html.escape(groups[current]['title'])}</b>.\n"
-                     "Чтобы сменить группу, нажмите другую кнопку внизу. /stop — отписаться.")
-        send_message(chat_id, intro, reply_markup=groups_keyboard(groups, current))
+            send_message(chat_id,
+                         f"Сейчас вы подписаны на группу <b>{html.escape(groups[current]['title'])}</b>. "
+                         "Сменить группу можно в настройках.", reply_markup=main_keyboard())
+        else:
+            send_message(chat_id, "Выберите свою группу. Буду присылать новые материалы Moodle.",
+                         reply_markup=groups_keyboard(groups))
+    elif command == "/settings" or text == BTN_SETTINGS:
+        if current in groups:
+            send_message(chat_id, "⚙️ Настройки. Выберите группу.", reply_markup=groups_keyboard(groups, current))
+        else:
+            send_message(chat_id, "Сначала выберите группу через /start.")
     elif command in ("/courses", "/deadlines") or text in (BTN_COURSES, BTN_DEADLINES):
         if current not in groups:
-            send_message(chat_id, "Сначала выберите группу на клавиатуре внизу или в меню.",
-                         reply_markup=groups_keyboard(groups))
+            send_message(chat_id, "Сначала выберите группу через /start.")
         elif command == "/courses" or text == BTN_COURSES:
             send_message(chat_id, courses_text(chat_id, current, groups, state))
         else:
@@ -605,15 +624,17 @@ def handle_message(msg, groups, state):
                          reply_markup={"remove_keyboard": True})
         else:
             send_message(chat_id, "Вы и так не подписаны. /start — выбрать группу.")
-    elif (key := find_group(text, groups)):
-        subscribe(chat_id, key, groups, state)
+    elif current in groups and find_group(text, groups):
+        send_message(chat_id, "Сменить группу можно в настройках.", reply_markup=main_keyboard())
     elif msg["chat"].get("type") == "private":
-        send_message(chat_id, "Не понял. Выберите группу на клавиатуре внизу или нажмите /start.",
-                     reply_markup=groups_keyboard(groups, current))
+        if current in groups:
+            send_message(chat_id, "Откройте меню бота.", reply_markup=main_keyboard())
+        else:
+            send_message(chat_id, "Сначала выберите группу через /start.")
 
 
 def handle_callback(cq, groups, state):
-    """Inline-кнопки из старых сообщений бота: тоже понимаем, но дальше — обычная клавиатура."""
+    """Обрабатывает выбор группы в сообщении бота."""
     data = cq.get("data") or ""
     msg = cq.get("message")
     key = data[len(CALLBACK_PREFIX):] if data.startswith(CALLBACK_PREFIX) else None
@@ -831,6 +852,8 @@ def get_deadlines(token, course_ids, old):
                                   "course": str(course["id"]), "name": a.get("name", "Задание"),
                                   "due": a["duedate"],
                                   "url": f"{MOODLE_URL}/mod/assign/view.php?id={a['cmid']}"})
+    except requests.exceptions.ConnectTimeout:
+        raise
     except (MoodleError, requests.RequestException, ValueError, KeyError) as e:
         log.warning("Задания не получены: %s", e)
         failed.add("assign")
@@ -842,6 +865,8 @@ def get_deadlines(token, course_ids, old):
                               "course": str(q["course"]), "name": q.get("name", "Тест"),
                               "due": q["timeclose"],
                               "url": f"{MOODLE_URL}/mod/quiz/view.php?id={q['coursemodule']}"})
+    except requests.exceptions.ConnectTimeout:
+        raise
     except (MoodleError, requests.RequestException, ValueError, KeyError) as e:
         log.warning("Тесты не получены: %s", e)
         failed.add("quiz")
@@ -970,6 +995,8 @@ def check_group(key, group, state):
         course_name = html.escape(enrolled.get(cid, {}).get("fullname") or f"Курс {cid}")
         try:
             new, meta = get_snapshot(token, cid)
+        except requests.exceptions.ConnectTimeout:
+            raise
         except (MoodleError, requests.RequestException, ValueError) as e:
             log.warning("Группа %s: не удалось получить курс %s: %s", key, cid, e)
             continue
@@ -1055,6 +1082,9 @@ def check_moodle(groups, state):
         try:
             check_group(key, group, state)
             error = None
+        except requests.exceptions.ConnectTimeout as e:
+            error = MOODLE_CONNECT_ERROR
+            log.error("Группа %s: %s", key, e)
         except (MoodleError, requests.RequestException, ValueError, KeyError) as e:
             error = str(e)
             log.error("Группа %s: %s", key, error)

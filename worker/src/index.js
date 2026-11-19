@@ -273,12 +273,24 @@ function esc(s) {
 }
 
 function groupsKeyboard(catalog, current) {
-  const buttons = catalog.groups.map((g) => ({ text: (g.key === current ? "✅ " : "") + g.title }));
+  const buttons = catalog.groups.map((g) => ({
+    text: (g.key === current ? "✅ " : "") + g.title,
+    callback_data: `g:${g.key}`,
+  }));
   const rows = [];
   for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
-  rows.push([{ text: BTN_COURSES }, { text: BTN_DEADLINES }]);
-  rows.push([{ text: BTN_SETTINGS }, { text: BTN_SAVED }]);
-  return { keyboard: rows, resize_keyboard: true, is_persistent: true, input_field_placeholder: "Выберите группу" };
+  return { inline_keyboard: rows };
+}
+
+function mainKeyboard() {
+  return {
+    keyboard: [
+      [{ text: BTN_COURSES }, { text: BTN_DEADLINES }],
+      [{ text: BTN_SETTINGS }, { text: BTN_SAVED }],
+    ],
+    resize_keyboard: true,
+    is_persistent: true,
+  };
 }
 
 // как часто бот проверяет Moodle — приходит из каталога (CHECK_EVERY_MIN в moodle_bot.py)
@@ -568,6 +580,7 @@ function settingsKeyboard(sub) {
   const btn = ([sec, label]) => ({ text: `${r.includes(sec) ? "✅" : "▫️"} ${label}`, callback_data: `r:${sec}` });
   return {
     inline_keyboard: [
+      [{ text: "Сменить группу", callback_data: "choose_group" }],
       [btn(REMINDER_OPTIONS[0]), btn(REMINDER_OPTIONS[1])],
       [btn(REMINDER_OPTIONS[2]), btn(REMINDER_OPTIONS[3])],
       [{ text: `📎 Файлы в чат: ${sub.f === false ? "выкл" : "вкл"}`, callback_data: "f" }],
@@ -675,8 +688,8 @@ async function subscribe(env, chatId, key, catalog, sub) {
     `${BTN_COURSES} — список курсов, ненужные можно отключить.\n` +
     `${BTN_SETTINGS} — когда напоминать о дедлайнах и присылать ли файлы.\n` +
     "🔎 Чтобы найти материал, просто напишите слово, например «лекция 5».\n" +
-    "Сменить группу — кнопкой внизу, /stop — отписаться.",
-    { reply_markup: groupsKeyboard(catalog, key) });
+    "Сменить группу можно в настройках. /stop — отписаться.",
+    { reply_markup: mainKeyboard() });
 }
 
 async function handleMessage(msg, catalog, env) {
@@ -693,17 +706,16 @@ async function handleMessage(msg, catalog, env) {
   let m;
 
   if (command === "/start") {
-    const intro = current
-      ? `Сейчас вы подписаны на группу <b>${esc(groupTitle(catalog, current))}</b>.\n` +
-        "Чтобы сменить группу, нажмите другую кнопку внизу. /stop — отписаться."
-      : "Выберите свою группу на клавиатуре внизу — буду присылать новые файлы из её курсов Moodle и напоминать о дедлайнах.";
-    return send(env, chatId, intro, { reply_markup: groupsKeyboard(catalog, current) });
-  }
-  if (command === "/courses" || command === "/deadlines" || text === BTN_COURSES || text === BTN_DEADLINES) {
     if (!current) {
-      return send(env, chatId, "Сначала выберите группу на клавиатуре внизу или в меню.",
+      return send(env, chatId, "Выберите свою группу. Буду присылать новые материалы Moodle и напоминать о дедлайнах.",
         { reply_markup: groupsKeyboard(catalog, null) });
     }
+    return send(env, chatId,
+      `Сейчас вы подписаны на группу <b>${esc(groupTitle(catalog, current))}</b>. Сменить группу можно в настройках.`,
+      { reply_markup: mainKeyboard() });
+  }
+  if (command === "/courses" || command === "/deadlines" || text === BTN_COURSES || text === BTN_DEADLINES) {
+    if (!current) return send(env, chatId, "Сначала выберите группу через /start.");
     if (command === "/courses" || text === BTN_COURSES) {
       return send(env, chatId, coursesText(catalog, current), { reply_markup: coursesKeyboard(catalog, current, muted) });
     }
@@ -749,14 +761,16 @@ async function handleMessage(msg, catalog, env) {
     return send(env, chatId, "Вы и так не подписаны. /start — выбрать группу.");
   }
   const key = findGroup(text, catalog);
-  if (key) return subscribe(env, chatId, key, catalog, sub);
+  if (current && key) {
+    return send(env, chatId, "Сменить группу можно в настройках.", { reply_markup: mainKeyboard() });
+  }
   // любой другой текст от подписчика — поиск по материалам
   if (current && text && !text.startsWith("/") && msg.chat.type === "private") {
     return send(env, chatId, await searchText(env, catalog, current, text));
   }
   if (msg.chat.type === "private") {
-    return send(env, chatId, "Не понял. Выберите группу на клавиатуре внизу или нажмите /start.",
-      { reply_markup: groupsKeyboard(catalog, current) });
+    return send(env, chatId, current ? "Откройте меню бота." : "Сначала выберите группу через /start.",
+      current ? { reply_markup: mainKeyboard() } : {});
   }
 }
 
@@ -801,8 +815,13 @@ async function handleCallback(cq, catalog, env) {
     return answer("Удалено из избранного. Обновить список — /saved");
   }
 
+  if (data === "choose_group") {
+    if (!sub || !catalog.groups.some((g) => g.key === sub.g)) return answer("Сначала выберите группу: /start");
+    await answer();
+    return send(env, chatId, "Выберите группу.", { reply_markup: groupsKeyboard(catalog, sub.g) });
+  }
+
   if (data.startsWith("g:")) {
-    // inline-кнопки групп из старых сообщений бота
     let key = data.slice(2);
     if (key === "my-group") key = "m104";
     if (!catalog.groups.some((g) => g.key === key)) return answer("Выберите группу заново: /start");
