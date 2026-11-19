@@ -30,6 +30,8 @@ const BTN_COURSES = "📚 Мои курсы";
 const BTN_DEADLINES = "⏰ Дедлайны";
 const BTN_SAVED = "⭐ Избранное";
 const BTN_SETTINGS = "⚙️ Настройки";
+const BTN_SUPPORT = "💬 Связаться с поддержкой";
+const SUPPORT_PROMPT = "Напишите в поддержку ответом на это сообщение. Здесь можно задать вопрос или попросить добавить именно вашу группу в бота.";
 const REMINDER_OPTIONS = [[259200, "за 3 дня"], [86400, "за сутки"], [10800, "за 3 часа"], [3600, "за 1 час"]];
 const DEFAULT_REMINDERS = [86400, 10800];
 const SEARCH_LIMIT = 15;
@@ -60,13 +62,24 @@ export default {
       });
     }
 
-    if (request.method === "POST" && url.pathname === "/telegram") {
-      if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== (await webhookToken(env))) {
+    if (request.method === "POST" && ["/telegram", "/telegram/support"].includes(url.pathname)) {
+      const supportOnly = url.pathname === "/telegram/support";
+      if (supportOnly && !env.SUPPORT_BOT_TOKEN) return new Response("not found", { status: 404 });
+      const secret = supportOnly ? await supportWebhookToken(env) : await webhookToken(env);
+      if (request.headers.get("X-Telegram-Bot-Api-Secret-Token") !== secret) {
         return new Response("forbidden", { status: 403 });
       }
       const update = await request.json();
       try {
-        await handleUpdate(update, env);
+        if (supportOnly) {
+          const catalog = await getCatalog(env);
+          const msg = update.message;
+          if (msg?.chat.type === "private" && catalog && isAdmin(catalog, String(msg.chat.id))) {
+            await handleSupportReply(msg, env, env.SUPPORT_BOT_TOKEN);
+          }
+        } else {
+          await handleUpdate(update, env, url.origin);
+        }
       } catch (e) {
         console.log("update error", (e && e.stack) || e);
       }
@@ -187,6 +200,10 @@ async function webhookToken(env) {
   return sha256hex(env.BOT_SYNC_SECRET.trim());
 }
 
+function supportWebhookToken(env) {
+  return sha256hex(`support-webhook:${env.BOT_SYNC_SECRET.trim()}`);
+}
+
 // Токен прежней (длинной) ссылки на календарь — оставлен, чтобы старые подписки не сломались
 async function calendarToken(env, group) {
   return (await sha256hex(`${env.BOT_SYNC_SECRET.trim()}:calendar:${group}`)).slice(0, 20);
@@ -263,8 +280,8 @@ async function putDone(env, chatId, ids) {
 
 // ------------------------------ Telegram -------------------------------
 
-async function tg(env, method, body) {
-  const r = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/${method}`, {
+async function tg(env, method, body, token = env.TELEGRAM_BOT_TOKEN) {
+  const r = await fetch(`https://api.telegram.org/bot${token}/${method}`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(body),
@@ -299,6 +316,7 @@ function mainKeyboard() {
     keyboard: [
       [{ text: BTN_COURSES }, { text: BTN_DEADLINES }],
       [{ text: BTN_SETTINGS }, { text: BTN_SAVED }],
+      [{ text: BTN_SUPPORT }],
     ],
     resize_keyboard: true,
     is_persistent: true,
@@ -638,6 +656,88 @@ function isAdmin(catalog, chatId) {
   return !!(catalog.admin && String(catalog.admin).trim() === chatId);
 }
 
+function supportPrompt(env, chatId) {
+  return send(env, chatId, SUPPORT_PROMPT, {
+    reply_markup: { force_reply: true, input_field_placeholder: "Сообщение для поддержки" },
+  });
+}
+
+function replyFromBot(msg, token) {
+  const reply = msg.reply_to_message;
+  return reply && String(reply.from?.id) === token.split(":")[0] ? reply.text : undefined;
+}
+
+async function supportSignature(env, reference) {
+  const encoder = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", encoder.encode(env.BOT_SYNC_SECRET.trim()),
+    { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const mac = await crypto.subtle.sign("HMAC", key, encoder.encode(`support-reply:${reference}`));
+  return Array.from(new Uint8Array(mac).slice(0, 16), (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function submitSupport(msg, catalog, env) {
+  const chatId = String(msg.chat.id);
+  const text = msg.text?.trim();
+  if (!text || text.length > 3500) {
+    await send(env, chatId, "Поддержка принимает текст до 3500 символов.");
+    return supportPrompt(env, chatId);
+  }
+  const admin = String(catalog?.admin || "").trim();
+  if (!admin) return send(env, chatId, "Поддержка пока недоступна. Попробуйте позже.");
+
+  const sub = await getSub(env, chatId);
+  const group = sub ? groupTitle(catalog, sub.g).slice(0, 150) : "группа не выбрана";
+  const reference = `${chatId}:${msg.message_id}`;
+  const signature = await supportSignature(env, reference);
+  const body = {
+    chat_id: admin,
+    text: `Обращение #${reference}:${signature}\nГруппа: ${group}\nОтветьте на это сообщение, чтобы написать студенту.\n\n${text}`,
+    link_preview_options: { is_disabled: true },
+  };
+  let delivered = env.SUPPORT_BOT_TOKEN && await tg(env, "sendMessage", body, env.SUPPORT_BOT_TOKEN);
+  if (!delivered?.ok) delivered = await tg(env, "sendMessage", body);
+  return send(env, chatId, delivered.ok ? "Сообщение отправлено в поддержку." :
+    "Не удалось отправить сообщение в поддержку. Попробуйте позже.");
+}
+
+async function handleSupportReply(msg, env, token) {
+  const notice = replyFromBot(msg, token) || "";
+  const route = notice.match(/^Обращение #(\d{1,16}:\d{1,16}):([a-f0-9]{32})\n/);
+  if (!route || await supportSignature(env, route[1]) !== route[2]) return false;
+  const admin = String(msg.chat.id);
+  const text = msg.text?.trim();
+  if (!text || text.length > 4000) {
+    await tg(env, "sendMessage", { chat_id: admin, text: "Введите текст ответа до 4000 символов." }, token);
+    return true;
+  }
+  const delivered = await tg(env, "sendMessage", {
+    chat_id: route[1].split(":")[0], text: `💬 Ответ поддержки\n\n${text}`,
+    link_preview_options: { is_disabled: true },
+  });
+  await tg(env, "sendMessage", {
+    chat_id: admin, text: delivered.ok ? "Ответ отправлен." : "Не удалось доставить ответ студенту.",
+  }, token);
+  return true;
+}
+
+async function setupSupportWebhook(env, chatId, origin) {
+  const token = env.SUPPORT_BOT_TOKEN;
+  if (!token || token.split(":")[0] === env.TELEGRAM_BOT_TOKEN.split(":")[0]) {
+    return send(env, chatId, "Задайте отдельный токен SUPPORT_BOT_TOKEN в Cloudflare Worker.");
+  }
+  const set = await tg(env, "setWebhook", {
+    url: `${origin}/telegram/support`,
+    secret_token: await supportWebhookToken(env),
+    allowed_updates: ["message"],
+  }, token);
+  if (!set.ok) return send(env, chatId, "Не удалось подключить бота поддержки. Проверьте его токен.");
+  const probe = await tg(env, "sendMessage", {
+    chat_id: chatId, text: "Бот поддержки подключён. Здесь будут обращения студентов.",
+  }, token);
+  return send(env, chatId, probe.ok ? "Отдельный бот поддержки подключён." :
+    "Webhook подключён. Нажмите «Начать» у отдельного бота и повторите /support_setup.");
+}
+
 async function statsText(env, catalog) {
   const subs = await listSubscribers(env);
   const all = Object.values(subs);
@@ -690,9 +790,9 @@ async function broadcastCommand(env, catalog, chatId, text) {
 
 // ------------------------------ Обработка ------------------------------
 
-async function handleUpdate(update, env) {
+async function handleUpdate(update, env, origin) {
   const catalog = await getCatalog(env);
-  if (update.message) return handleMessage(update.message, catalog, env);
+  if (update.message) return handleMessage(update.message, catalog, env, origin);
   if (update.callback_query) return handleCallback(update.callback_query, catalog, env);
 }
 
@@ -710,10 +810,21 @@ async function subscribe(env, chatId, key, catalog, sub) {
     { reply_markup: mainKeyboard() });
 }
 
-async function handleMessage(msg, catalog, env) {
+async function handleMessage(msg, catalog, env, origin) {
   const chatId = String(msg.chat.id);
   const text = (msg.text || "").trim();
   const command = text.startsWith("/") ? text.split(/\s+/)[0].split("@")[0].toLowerCase() : "";
+
+  if (msg.chat.type === "private" && catalog && isAdmin(catalog, chatId)) {
+    if (command === "/support_setup") return setupSupportWebhook(env, chatId, origin);
+    if (await handleSupportReply(msg, env, env.TELEGRAM_BOT_TOKEN)) return;
+  }
+  if (msg.chat.type === "private" && (command === "/support" || text === BTN_SUPPORT)) {
+    return supportPrompt(env, chatId);
+  }
+  if (msg.chat.type === "private" && replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) === SUPPORT_PROMPT) {
+    return submitSupport(msg, catalog, env);
+  }
 
   if (!catalog || !catalog.groups || !catalog.groups.length) {
     return send(env, chatId, "Бот ещё настраивается. Попробуйте через несколько минут.");
@@ -726,7 +837,10 @@ async function handleMessage(msg, catalog, env) {
   if (command === "/start") {
     if (!current) {
       return send(env, chatId, "Выберите свою группу. Буду присылать новые материалы Moodle и напоминать о дедлайнах.",
-        { reply_markup: groupsKeyboard(catalog, null) });
+        { reply_markup: { inline_keyboard: [
+          ...groupsKeyboard(catalog, null).inline_keyboard,
+          [{ text: BTN_SUPPORT, callback_data: "support" }],
+        ] } });
     }
     return send(env, chatId,
       `Сейчас вы подписаны на группу <b>${esc(groupTitle(catalog, current))}</b>. Сменить группу можно в настройках.`,
@@ -796,6 +910,10 @@ async function handleCallback(cq, catalog, env) {
   const data = cq.data || "";
   const msg = cq.message;
   const answer = (text) => tg(env, "answerCallbackQuery", { callback_query_id: cq.id, text });
+  if (data === "support" && msg?.chat.type === "private") {
+    await answer();
+    return supportPrompt(env, String(msg.chat.id));
+  }
   if (!catalog || !msg) return answer("Бот ещё настраивается");
 
   const chatId = String(msg.chat.id);
