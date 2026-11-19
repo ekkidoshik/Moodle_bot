@@ -115,6 +115,9 @@ export default {
       if (request.headers.get("Authorization") !== `Bearer ${env.BOT_SYNC_SECRET.trim()}`) {
         return new Response("forbidden", { status: 403 });
       }
+      if (request.method === "GET" && url.pathname === "/api/main-keyboard") {
+        return json(mainKeyboard());
+      }
       if (request.method === "GET" && url.pathname === "/api/subscribers") {
         const since = url.searchParams ? url.searchParams.get("since") : null;
         if (since === null) return json(await listSubscribers(env)); // старый формат

@@ -824,6 +824,35 @@ def apply_subscribers(state, subs):
     state["done"] = {chat: s["done"] for chat, s in subs.items() if s.get("done")}
 
 
+def refresh_subscriber_keyboards(state):
+    """Один раз обновляет клавиатуру у подписчиков, существующих на момент запуска."""
+    refresh = state.setdefault("support_keyboard_refresh", {
+        "pending": sorted(state["subscribers"]), "sent": 0, "unavailable": 0,
+    })
+    if not refresh["pending"]:
+        return
+    keyboard = relay("GET", "/api/main-keyboard")
+    for chat_id in refresh["pending"][:40]:
+        if chat_id not in state["subscribers"]:
+            refresh["unavailable"] += 1
+        else:
+            try:
+                send_message(chat_id, "Меню бота обновилось. Теперь в нём есть кнопка «Связаться с поддержкой».",
+                             reply_markup=keyboard, disable_notification=True)
+                refresh["sent"] += 1
+            except TelegramError as e:
+                if not chat_is_gone(e):
+                    log.warning("Не удалось обновить клавиатуру чата %s: %s", mask(chat_id), e)
+                    continue
+                refresh["unavailable"] += 1
+            except requests.RequestException as e:
+                log.warning("Сбой при обновлении клавиатуры чата %s: %s", mask(chat_id), e)
+                continue
+        refresh["pending"].remove(chat_id)
+    log.info("Обновление клавиатур: доставлено %d, недоступно %d, осталось %d",
+             refresh["sent"], refresh["unavailable"], len(refresh["pending"]))
+
+
 def push_to_relay(groups, state):
     """Отдаёт Worker группы, курсы и дедлайны (только если что-то изменилось)."""
     if GONE_CHATS:
@@ -1201,6 +1230,11 @@ def run(groups, state):
         # без свежих подписок проживём (останутся прошлые), Moodle всё равно проверим
         sync_error = f"{type(e).__name__}: {e}"
         log.error("Не удалось получить сообщения/подписчиков: %s", e)
+    if relay_enabled() and sync_error is None:
+        try:
+            refresh_subscriber_keyboards(state)
+        except (requests.RequestException, ValueError) as e:
+            log.warning("Не удалось загрузить клавиатуру для обновления: %s", e)
     save_state(state)
 
     check_moodle(groups, state)
@@ -1230,6 +1264,11 @@ def run(groups, state):
                 "group_errors": state["group_errors"],
                 "subscribers": len(state["subscribers"]),
                 "relay_migrated": bool(state.get("relay_migrated")),
+                "keyboard_refresh": {
+                    "sent": state["support_keyboard_refresh"]["sent"],
+                    "unavailable": state["support_keyboard_refresh"]["unavailable"],
+                    "pending": len(state["support_keyboard_refresh"]["pending"]),
+                } if "support_keyboard_refresh" in state else None,
             })
         except (requests.RequestException, ValueError) as e:
             log.warning("Не удалось отправить отчёт в Worker: %s", e)
