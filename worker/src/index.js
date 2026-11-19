@@ -154,6 +154,18 @@ export default {
         if (queue.length) await env.BOT_KV.delete("broadcasts");
         return json(queue);
       }
+      if (request.method === "GET" && url.pathname === "/api/file-requests") {
+        const { keys } = await env.BOT_KV.list({ prefix: "file-request:", limit: 3 });
+        const jobs = await Promise.all(keys.map(async ({ name }) => ({
+          id: name.slice("file-request:".length), job: await env.BOT_KV.get(name, "json"),
+        })));
+        return json(jobs.filter(({ job }) => job));
+      }
+      const fileRequest = url.pathname.match(/^\/api\/file-requests\/([0-9a-f-]+)$/);
+      if (request.method === "DELETE" && fileRequest) {
+        await env.BOT_KV.delete(`file-request:${fileRequest[1]}`);
+        return json({ ok: true });
+      }
       if (request.method === "PUT" && url.pathname === "/api/catalog") {
         await env.BOT_KV.put("catalog", await request.text());
         return json({ ok: true });
@@ -360,9 +372,15 @@ function itemLink(item) {
   return /^https?:\/\//i.test(item.u || "") ? `<a href="${esc(item.u)}">${name}</a>` : name;
 }
 
-function materialSaveRows(materials) {
-  return materials.filter((m) => m.id && m.u)
-    .map((m) => [{ ...saveButton(`m:${m.id}`), text: `⭐ ${m.n.slice(0, 40)}` }]);
+function courseMaterialRows(materials) {
+  return materials.filter((m) => m.id && (m.u || m.f?.length)).map((m) => [
+    ...(m.f?.length ? [{ text: `📎 ${m.n.slice(0, 40)}`, callback_data: `files:${m.c}:${m.id}:0` }] : []),
+    ...(m.u ? [{ ...saveButton(`m:${m.id}`), text: m.f?.length ? "⭐" : `⭐ ${m.n.slice(0, 40)}` }] : []),
+  ]);
+}
+
+function courseMaterialLine(material) {
+  return material.f?.length ? esc(material.n.slice(0, 100)) : itemLink(material);
 }
 
 async function courseMaterials(env, catalog, key, chatId, cid, page, filter) {
@@ -379,9 +397,9 @@ async function courseMaterials(env, catalog, key, chatId, cid, page, filter) {
   const name = esc(catalog.course_names[key][cid].slice(0, 180));
   const lines = shown.map((m) => {
     const filenames = (m.f || []).slice(0, 2).map((file) => esc(file.slice(0, 85)));
-    return `• ${itemLink(m)}` + (filenames.length ? `\n   📎 ${filenames.join(", ")}` : "");
+    return `• ${courseMaterialLine(m)}` + (filenames.length ? `\n   📎 ${filenames.join(", ")}` : "");
   });
-  const rows = materialSaveRows(shown);
+  const rows = courseMaterialRows(shown);
   const nav = [];
   if (current > 0) nav.push({ text: "← Назад", callback_data: `materials:${cid}:${filter}:${current - 1}` });
   if (current < last) nav.push({ text: "Далее →", callback_data: `materials:${cid}:${filter}:${current + 1}` });
@@ -409,7 +427,7 @@ async function courseFolder(env, catalog, key, chatId, cid) {
     .sort((a, b) => (b.t || 0) - (a.t || 0) || Number(b.id || 0) - Number(a.id || 0))
     .slice(0, 5);
   const deadlineLines = deadlines.map((d) => `• ${itemLink({ n: d.name, u: d.url })} · ${fmtTime(d.due)}`);
-  const materialLines = materials.map((m) => `• ${itemLink(m)}`);
+  const materialLines = materials.map((m) => `• ${courseMaterialLine(m)}`);
   const text = [
     `📂 <b>${esc(name.slice(0, 180))}</b>`,
     `<b>Ближайшие дедлайны</b>\n${deadlineLines.join("\n") || "Нет несданных дедлайнов"}`,
@@ -419,7 +437,7 @@ async function courseFolder(env, catalog, key, chatId, cid) {
     [{ text: "Открыть курс в Moodle", url: `${base}/course/view.php?id=${cid}` }],
     ...deadlines.map((d) => [{ ...saveButton(d.id), text: `⭐ ${d.name.slice(0, 40)}` }]),
     [{ text: "Все материалы", callback_data: `materials:${cid}:all:0` }],
-    ...materialSaveRows(materials),
+    ...courseMaterialRows(materials),
   ];
   return send(env, chatId, text, { reply_markup: { inline_keyboard: rows } });
 }
@@ -789,6 +807,41 @@ async function handleCallback(cq, catalog, env) {
     }
     return sent;
   };
+
+  const fileAction = data.match(/^(files|file):(\d+):(\d+):(\d+)$/);
+  if (fileAction) {
+    const [, action, cid, mid, position] = fileAction;
+    const group = sub?.g;
+    if (!catalog.course_names[group]?.[cid]) return answer("Откройте актуальный список курсов");
+    const index = (await env.BOT_KV.get(`index:${group}`, "json")) || [];
+    const material = index.find((m) => m.c === cid && m.id === mid);
+    const files = material?.f || [];
+    const offset = Number(position);
+    if (offset >= files.length) return answer("Файл недоступен. Откройте список материалов заново.");
+    if (action === "file" || files.length === 1) {
+      const id = crypto.randomUUID();
+      try {
+        await env.BOT_KV.put(`file-request:${id}`, JSON.stringify({
+          chat: chatId, group, cid, mid, path: files[offset],
+        }), { expirationTtl: 3600 });
+      } catch (e) {
+        console.log("Не удалось записать запрос на файл:", e.message);
+        return answer("Не удалось запросить файл. Попробуйте позже.");
+      }
+      return answer("Бот отправит файл при ближайшей проверке Moodle.");
+    }
+    const rows = files.slice(offset, offset + 8).map((path, i) => [
+      { text: `📎 ${path.split("/").pop().slice(0, 60)}`, callback_data: `file:${cid}:${mid}:${offset + i}` },
+    ]);
+    const nav = [];
+    if (offset > 0) nav.push({ text: "← Назад", callback_data: `files:${cid}:${mid}:${offset - 8}` });
+    if (offset + 8 < files.length) nav.push({ text: "Далее →", callback_data: `files:${cid}:${mid}:${offset + 8}` });
+    if (nav.length) rows.push(nav);
+    rows.push([{ text: "К папке курса", callback_data: `course:${cid}` }]);
+    await answer();
+    return replaceMessage(send(env, chatId, `📎 <b>${esc(material.n.slice(0, 100))}</b>\nВыберите файл.`,
+      { reply_markup: { inline_keyboard: rows } }));
+  }
 
   const folder = data.match(/^course:(\d+)$/);
   if (folder) {

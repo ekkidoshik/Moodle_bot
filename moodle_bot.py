@@ -749,6 +749,59 @@ def sync_telegram(groups, state):
                 log.warning("Рассылка в %s не ушла: %s", mask(chat_id), e)
         log.info("Рассылка отправлена: %d получателей", len(chats))
 
+    process_file_requests(groups, state)
+
+
+def process_file_requests(groups, state):
+    try:
+        requests_to_send = relay("GET", "/api/file-requests")
+    except requests.HTTPError as e:
+        if e.response.status_code == 404:  # Worker ещё не обновился
+            return
+        raise
+
+    fetchers = {}
+    stop_after = time.monotonic() + 75  # оставляем время на обычную проверку Moodle
+    for entry in requests_to_send:
+        if time.monotonic() >= stop_after:
+            break
+        job = entry["job"]
+        chat_id, group, cid = job["chat"], job["group"], job["cid"]
+        config = groups.get(group)
+        if (config and state["subscribers"].get(chat_id) == group
+                and cid in state["course_names"].get(group, {})
+                and (not config["courses"] or int(cid) in config["courses"])):
+            try:
+                send_requested_file(chat_id, config, job, fetchers)
+            except (MoodleError, TelegramError, requests.RequestException, ValueError, KeyError) as e:
+                log.warning("Не удалось обработать запрос на файл для %s: %s", mask(chat_id), e)
+                try:
+                    send_message(chat_id, "Не удалось отправить файл. Попробуйте запросить его ещё раз.")
+                except (TelegramError, requests.RequestException) as notify_error:
+                    log.warning("Не удалось сообщить об ошибке запроса файла: %s", notify_error)
+        relay("DELETE", f"/api/file-requests/{entry['id']}")
+
+
+def send_requested_file(chat_id, config, job, fetchers):
+    cid, mid, path = job["cid"], job["mid"], job["path"]
+    cache_key = (job["group"], cid)
+    if cache_key not in fetchers:
+        token = os.getenv(config["token_env"], "").strip()
+        if not token:
+            raise MoodleError("не задан токен группы")
+        _, meta = get_snapshot(token, cid)
+        fetchers[cache_key] = FileFetcher(token, meta)
+    fetcher = fetchers[cache_key]
+    key = next((name for name in fetcher.meta.get(mid, {}) if name.lstrip("/") == path), None)
+    info = fetcher.info(mid, key)
+    if info and info["size"] > MAX_FILE_BYTES:
+        send_message(chat_id, "Файл слишком большой для отправки ботом. Откройте его в Moodle.")
+        return
+    content = fetcher.get(mid, key)
+    if content is None:
+        raise MoodleError("файл недоступен")
+    tg("sendDocument", files={"document": (path.rsplit("/", 1)[-1], content)}, chat_id=chat_id)
+
 
 def apply_subscribers(state, subs):
     state["subscribers"] = {chat: s["group"] for chat, s in subs.items() if s.get("group")}
