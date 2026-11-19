@@ -746,10 +746,9 @@ async function statsText(env, catalog) {
   const all = Object.values(subs);
   const lines = catalog.groups.map((g) => {
     const mine = all.filter((s) => s.group === g.key);
-    const muted = mine.filter((s) => s.muted.length).length;
     const noFiles = mine.filter((s) => s.files === false).length;
     return `• <b>${esc(g.title)}</b>: ${mine.length}` +
-      (muted ? `, отключали курсы: ${muted}` : "") + (noFiles ? `, без файлов: ${noFiles}` : "");
+      (noFiles ? `, без файлов: ${noFiles}` : "");
   });
   const report = await env.BOT_KV.get("report", "json");
   let run = "Отчётов о запусках ещё нет.";
