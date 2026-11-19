@@ -771,19 +771,23 @@ async function broadcastCommand(env, catalog, chatId, text) {
       "Использование:\n<code>/broadcast текст</code> — всем подписчикам\n" +
       `<code>/broadcast m104 текст</code> — одной группе (ключи: ${esc(keys)})`);
   }
+  return broadcastToSubscribers(env, catalog, chatId, group, body);
+}
+
+async function broadcastToSubscribers(env, catalog, chatId, group, body, options = {}) {
   const subs = await listSubscribers(env);
   const targets = Object.entries(subs).filter(([, s]) => !group || s.group === group).map(([c]) => c);
   const whom = group ? `группе ${esc(groupTitle(catalog, group))}` : "всем";
   if (targets.length <= DIRECT_BROADCAST_LIMIT) {
     let ok = 0;
     for (const c of targets) {
-      const r = await tg(env, "sendMessage", { chat_id: c, text: body, disable_web_page_preview: true });
+      const r = await tg(env, "sendMessage", { chat_id: c, text: body, disable_web_page_preview: true, ...options });
       if (r.ok) ok++;
     }
     return send(env, chatId, `📣 Отправлено ${whom}: ${ok} из ${targets.length}.`);
   }
   const queue = (await env.BOT_KV.get("broadcasts", "json")) || [];
-  queue.push({ group, text: body });
+  queue.push({ group, text: body, ...options });
   await env.BOT_KV.put("broadcasts", JSON.stringify(queue));
   return send(env, chatId, `📣 Получателей ${targets.length} (${whom}) — разошлю при ближайшей проверке, в течение ${checkEvery(catalog)} минут.`);
 }
@@ -816,6 +820,11 @@ async function handleMessage(msg, catalog, env, origin) {
   const command = text.startsWith("/") ? text.split(/\s+/)[0].split("@")[0].toLowerCase() : "";
 
   if (msg.chat.type === "private" && catalog && isAdmin(catalog, chatId)) {
+    if (command === "/refresh_keyboard") {
+      return broadcastToSubscribers(env, catalog, chatId, null,
+        "Меню бота обновилось. Теперь в нём есть кнопка «Связаться с поддержкой».",
+        { reply_markup: mainKeyboard(), disable_notification: true });
+    }
     if (command === "/support_setup") return setupSupportWebhook(env, chatId, origin);
     if (await handleSupportReply(msg, env, env.TELEGRAM_BOT_TOKEN)) return;
   }

@@ -61,7 +61,7 @@ RENAMED_GROUPS = {"my-group": "m104"}
 
 # Команды бота: ключи групп не должны с ними совпадать.
 RESERVED_COMMANDS = {"start", "stop", "courses", "deadlines", "search", "settings",
-                     "stats", "broadcast", "calendar", "id", "support", "support_setup"}
+                     "stats", "broadcast", "calendar", "id", "support", "support_setup", "refresh_keyboard"}
 BTN_COURSES = "📚 Мои курсы"
 BTN_DEADLINES = "⏰ Дедлайны"
 BTN_SETTINGS = "⚙️ Настройки"
@@ -745,9 +745,10 @@ def sync_telegram(groups, state):
     for b in relay("POST", "/api/broadcasts/take"):
         chats = [c for c, g in state["subscribers"].items()
                  if not b.get("group") or g == b["group"]]
+        options = {key: b[key] for key in ("reply_markup", "disable_notification") if key in b}
         for chat_id in chats:
             try:
-                send_message(chat_id, b["text"], html_mode=False)
+                send_message(chat_id, b["text"], html_mode=False, **options)
             except (TelegramError, requests.RequestException) as e:
                 log.warning("Рассылка в %s не ушла: %s", mask(chat_id), e)
         log.info("Рассылка отправлена: %d получателей", len(chats))
