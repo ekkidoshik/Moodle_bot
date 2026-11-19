@@ -682,7 +682,7 @@ async function subscribe(env, chatId, key, catalog, sub) {
   // у другой группы другие курсы — отключённые сбрасываем
   const muted = sub && sub.g === key ? sub.m : [];
   await putSub(env, chatId, { ...(sub || {}), g: key, m: muted });
-  await send(env, chatId,
+  return send(env, chatId,
     `✅ Группа <b>${esc(groupTitle(catalog, key))}</b> выбрана.\n` +
     "Буду присылать новые и обновлённые файлы из её курсов и напоминать о дедлайнах за сутки и за 3 часа.\n\n" +
     `${BTN_COURSES} — список курсов, ненужные можно отключить.\n` +
@@ -782,13 +782,20 @@ async function handleCallback(cq, catalog, env) {
 
   const chatId = String(msg.chat.id);
   const sub = await getSub(env, chatId);
+  const replaceMessage = async (replacement) => {
+    const sent = await replacement;
+    if (sent.ok) {
+      await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
+    }
+    return sent;
+  };
 
   const folder = data.match(/^course:(\d+)$/);
   if (folder) {
     const key = sub?.g;
     if (!catalog.course_names[key]?.[folder[1]]) return answer("Откройте актуальный список курсов");
     await answer();
-    return courseFolder(env, catalog, key, chatId, folder[1]);
+    return replaceMessage(courseFolder(env, catalog, key, chatId, folder[1]));
   }
   const materials = data.match(/^materials:(\d+):(all|ktp|brs):(\d+)$/);
   if (materials) {
@@ -796,7 +803,7 @@ async function handleCallback(cq, catalog, env) {
     const key = sub?.g;
     if (!catalog.course_names[key]?.[cid]) return answer("Откройте актуальный список курсов");
     await answer();
-    return courseMaterials(env, catalog, key, chatId, cid, Number(page), filter);
+    return replaceMessage(courseMaterials(env, catalog, key, chatId, cid, Number(page), filter));
   }
   const save = data.match(/^sv:((?:m|assign|quiz):\d+)$/);
   if (save) {
@@ -807,7 +814,7 @@ async function handleCallback(cq, catalog, env) {
   const page = data.match(/^saved:(\d+)$/);
   if (page) {
     await answer();
-    return savedMessage(env, chatId, Number(page[1]));
+    return replaceMessage(savedMessage(env, chatId, Number(page[1])));
   }
   const remove = data.match(/^rm:((?:m|assign|quiz):\d+)$/);
   if (remove) {
@@ -818,7 +825,7 @@ async function handleCallback(cq, catalog, env) {
   if (data === "choose_group") {
     if (!sub || !catalog.groups.some((g) => g.key === sub.g)) return answer("Сначала выберите группу: /start");
     await answer();
-    return send(env, chatId, "Выберите группу.", { reply_markup: groupsKeyboard(catalog, sub.g) });
+    return replaceMessage(send(env, chatId, "Выберите группу.", { reply_markup: groupsKeyboard(catalog, sub.g) }));
   }
 
   if (data.startsWith("g:")) {
@@ -826,7 +833,7 @@ async function handleCallback(cq, catalog, env) {
     if (key === "my-group") key = "m104";
     if (!catalog.groups.some((g) => g.key === key)) return answer("Выберите группу заново: /start");
     await answer("Готово");
-    return subscribe(env, chatId, key, catalog, sub);
+    return replaceMessage(subscribe(env, chatId, key, catalog, sub));
   }
 
   if (data.startsWith("c:")) {

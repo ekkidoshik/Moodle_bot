@@ -648,7 +648,12 @@ def handle_callback(cq, groups, state):
         log.info("answerCallbackQuery: %s", e)
 
     if msg and key in groups:
-        subscribe(str(msg["chat"]["id"]), key, groups, state)
+        chat_id = str(msg["chat"]["id"])
+        subscribe(chat_id, key, groups, state)
+        try:
+            tg("deleteMessage", chat_id=chat_id, message_id=msg["message_id"])
+        except (TelegramError, requests.RequestException) as e:
+            log.info("deleteMessage: %s", e)
 
 
 def process_updates(groups, state):
