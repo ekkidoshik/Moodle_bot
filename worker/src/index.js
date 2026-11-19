@@ -360,24 +360,32 @@ function fmtLeft(sec) {
   return `${Math.max(1, Math.floor(sec / 60))} мин`;
 }
 
-function coursesKeyboard(catalog, key, muted) {
-  const names = catalog.course_names[key] || {};
-  const rows = Object.entries(names)
-    .sort((a, b) => a[1].localeCompare(b[1], "ru"))
-    .map(([cid, name]) => [
-      { text: `📂 ${name.slice(0, 48)}`, callback_data: `course:${cid}` },
-      { text: muted.includes(cid) ? "🔕" : "🔔", callback_data: `c:${cid}` },
-    ]);
-  return { inline_keyboard: rows };
-}
-
-function coursesText(catalog, key) {
-  const names = catalog.course_names[key] || {};
-  if (!Object.keys(names).length) {
-    return `Курсы группы <b>${esc(groupTitle(catalog, key))}</b> появятся после ближайшей проверки Moodle (до ${checkEvery(catalog)} минут).`;
+function showCourses(env, chatId, catalog, key, muted, page = 0) {
+  const courses = Object.entries(catalog.course_names[key] || {})
+    .sort((a, b) => a[1].localeCompare(b[1], "ru") || Number(a[0]) - Number(b[0]));
+  const group = esc(groupTitle(catalog, key));
+  if (!courses.length) {
+    return send(env, chatId, `Курсы группы <b>${group}</b> появятся после ближайшей проверки Moodle (до ${checkEvery(catalog)} минут).`);
   }
-  return (`📚 Курсы группы <b>${esc(groupTitle(catalog, key))}</b>.\n\n` +
-    "Нажмите на название, чтобы открыть папку курса. Колокольчик управляет уведомлениями.");
+
+  const pageSize = 8;
+  const last = Math.ceil(courses.length / pageSize) - 1;
+  const current = Math.min(page, last);
+  const offset = current * pageSize;
+  const shown = courses.slice(offset, offset + pageSize);
+  const names = shown.map(([, name], i) => `<b>${offset + i + 1}.</b> ${esc(name)}`);
+  const rows = shown.map(([cid], i) => [
+    { text: `📂 Курс №${offset + i + 1}`, callback_data: `course:${cid}` },
+    { text: muted.includes(cid) ? "🔕" : "🔔", callback_data: `c:${cid}` },
+  ]);
+  const nav = [];
+  if (current > 0) nav.push({ text: "← Назад", callback_data: `courses:${current - 1}` });
+  if (current < last) nav.push({ text: "Далее →", callback_data: `courses:${current + 1}` });
+  if (nav.length) rows.push(nav);
+  const pageLabel = last ? ` · ${current + 1}/${last + 1}` : "";
+  return send(env, chatId, `📚 Курсы группы <b>${group}</b>${pageLabel}\n\n${names.join("\n\n")}\n\n` +
+    "Кнопка с номером открывает курс. Колокольчик рядом управляет уведомлениями.",
+    { reply_markup: { inline_keyboard: rows } });
 }
 
 function doneButton(d, isDone) {
@@ -860,7 +868,7 @@ async function handleMessage(msg, catalog, env, origin) {
   if (command === "/courses" || command === "/deadlines" || text === BTN_COURSES || text === BTN_DEADLINES) {
     if (!current) return send(env, chatId, "Сначала выберите группу через /start.");
     if (command === "/courses" || text === BTN_COURSES) {
-      return send(env, chatId, coursesText(catalog, current), { reply_markup: coursesKeyboard(catalog, current, muted) });
+      return showCourses(env, chatId, catalog, current, muted);
     }
     const dm = deadlinesMessage(catalog, current, muted, await getDone(env, chatId));
     return send(env, chatId, dm.text, dm.markup ? { reply_markup: dm.markup } : {});
@@ -891,7 +899,7 @@ async function handleMessage(msg, catalog, env, origin) {
     if (!name) return send(env, chatId, "Такого курса нет в вашей группе. Список: /courses");
     const next = m[1] === "off" ? [...muted, m[2]] : muted.filter((c) => c !== m[2]);
     await putSub(env, chatId, { ...sub, g: current, m: next });
-    return send(env, chatId, coursesText(catalog, current), { reply_markup: coursesKeyboard(catalog, current, next) });
+    return showCourses(env, chatId, catalog, current, next);
   }
   if (command === "/stop") {
     if (sub) {
@@ -973,6 +981,14 @@ async function handleCallback(cq, catalog, env) {
       { reply_markup: { inline_keyboard: rows } }));
   }
 
+  const coursesPage = data.match(/^courses:(\d+)$/);
+  if (coursesPage) {
+    const key = sub?.g;
+    if (!catalog.groups.some((g) => g.key === key)) return answer("Сначала выберите группу: /start");
+    await answer();
+    return replaceMessage(showCourses(env, chatId, catalog, key, sub.m || [], Number(coursesPage[1])));
+  }
+
   const folder = data.match(/^course:(\d+)$/);
   if (folder) {
     const key = sub?.g;
@@ -1029,8 +1045,12 @@ async function handleCallback(cq, catalog, env) {
     const next = mute ? [...muted, cid] : muted.filter((c) => c !== cid);
     await putSub(env, chatId, { ...sub, g: current, m: next });
     await answer(`${mute ? "🔕 Отключено" : "🔔 Включено"}: ${name}`.slice(0, 200));
+    const rows = msg.reply_markup?.inline_keyboard;
+    if (!rows) return;
+    const updated = rows.map((row) => row.map((button) => button.callback_data === data
+      ? { ...button, text: mute ? "🔕" : "🔔" } : button));
     return tg(env, "editMessageReplyMarkup", {
-      chat_id: chatId, message_id: msg.message_id, reply_markup: coursesKeyboard(catalog, current, next),
+      chat_id: chatId, message_id: msg.message_id, reply_markup: { inline_keyboard: updated },
     });
   }
   if (data.startsWith("d:")) {
