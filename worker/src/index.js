@@ -383,7 +383,7 @@ function showCourses(env, chatId, catalog, key, muted, page = 0) {
     return send(env, chatId, `Курсы группы <b>${group}</b> появятся после ближайшей проверки Moodle (до ${checkEvery(catalog)} минут).`);
   }
 
-  const pageSize = 8;
+  const pageSize = 5;
   const last = Math.ceil(courses.length / pageSize) - 1;
   const current = Math.min(page, last);
   const offset = current * pageSize;
