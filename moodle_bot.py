@@ -903,7 +903,7 @@ def send_reminders(key, state):
     log.info("Группа %s: сработавших напоминаний о дедлайнах: %d", key, len(triggered))
 
 
-def send_files(fetcher, course_name, files, chat_ids, state, materials=None):
+def send_files(fetcher, course_name, files, chat_ids, state):
     """Присылает новые/обновлённые файлы документами. Каждый файл загружается
     в Telegram один раз, остальным уходит по file_id."""
     chat_ids = [c for c in chat_ids if user_wants_files(state, c)]
@@ -919,23 +919,16 @@ def send_files(fetcher, course_name, files, chat_ids, state, materials=None):
         if content is None:
             continue
 
-        caption = f"📎 {html.escape(name)}\n{course_name}"[:1000]
-        material = (materials or {}).get(mid)
-        extra = {}
-        if material and material["url"]:
-            extra["reply_markup"] = {"inline_keyboard": [
-                [{"text": "⭐ Сохранить материал", "callback_data": f"sv:m:{mid}"}]
-            ]}
-        upload_extra = {"reply_markup": json.dumps(extra["reply_markup"])} if extra else {}
+        caption = f"📎 {name}\n{course_name}"[:500]
         file_id = None
         for chat_id in chat_ids:
             try:
                 if file_id:
                     tg("sendDocument", chat_id=chat_id, document=file_id,
-                       caption=caption, parse_mode="HTML", **extra)
+                       caption=caption)
                 else:
                     res = tg("sendDocument", files={"document": (name, content)},
-                             chat_id=chat_id, caption=caption, parse_mode="HTML", **upload_extra)
+                             chat_id=chat_id, caption=caption)
                     file_id = res["document"]["file_id"]
             except TelegramError as e:
                 if chat_is_gone(e):
@@ -1005,18 +998,18 @@ def check_group(key, group, state):
             materials = [(mid, new[mid]["name"]) for mid in changed_ids if new[mid]["url"]]
             buttons = material_save_buttons(materials) if relay_enabled() else []
             extra = {"reply_markup": {"inline_keyboard": buttons}} if buttons else {}
-            # у кого включена сводка — копим до вечера, остальным сразу
-            for c in [c for c in subscribers if user_wants_digest(state, c)]:
-                state["digest"].setdefault(c, []).append(
-                    {"text": text, "materials": materials[:10]} if buttons else text)
-            subscribers = [c for c in subscribers if not user_wants_digest(state, c)]
-            if not broadcast(subscribers, text, state, **extra):
+            immediate = [c for c in subscribers if not user_wants_digest(state, c)]
+            if not broadcast(immediate, text, state, **extra):
                 # не доставили никому — оставим старый снимок и попробуем в следующий раз
                 continue
+            for c in subscribers:
+                if user_wants_digest(state, c):
+                    state["digest"].setdefault(c, []).append(
+                        {"text": text, "materials": materials[:10]} if buttons else text)
             log.info("Группа %s, курс %s: %d изменений, подписчиков %d",
                      key, cid, len(changes), len(subscribers))
-            send_files(fetcher, course_name, changed_files(old_snapshot, new), subscribers, state,
-                       new if relay_enabled() else None)
+            send_files(fetcher, html.unescape(course_name), changed_files(old_snapshot, new),
+                       [c for c in subscribers if c in state["subscribers"]], state)
         snapshots[scid] = new
 
     state["deadlines"][key] = get_deadlines(token, course_ids, state["deadlines"].get(key, []))
