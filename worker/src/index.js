@@ -360,6 +360,21 @@ function fmtLeft(sec) {
   return `${Math.max(1, Math.floor(sec / 60))} мин`;
 }
 
+function courseButtonLabel(name, otherNames) {
+  const chars = Array.from(name);
+  if (chars.length <= 34) return name;
+  const similar = otherNames.filter((other) =>
+    other !== name && other.startsWith(chars.slice(0, 18).join("")) && other.endsWith(chars.slice(-15).join("")));
+  if (similar.length) {
+    const shared = chars.findIndex((_, i) => similar.every((other) => Array.from(other)[i] !== chars[i]));
+    if (shared >= 0) {
+      const start = Math.max(10, shared - 5);
+      return `${chars.slice(0, 10).join("").trimEnd()}…${chars.slice(start, start + 22).join("").trim()}${start + 22 < chars.length ? "…" : ""}`;
+    }
+  }
+  return `${chars.slice(0, 18).join("").trimEnd()}…${chars.slice(-15).join("").trimStart()}`;
+}
+
 function showCourses(env, chatId, catalog, key, muted, page = 0) {
   const courses = Object.entries(catalog.course_names[key] || {})
     .sort((a, b) => a[1].localeCompare(b[1], "ru") || Number(a[0]) - Number(b[0]));
@@ -373,9 +388,10 @@ function showCourses(env, chatId, catalog, key, muted, page = 0) {
   const current = Math.min(page, last);
   const offset = current * pageSize;
   const shown = courses.slice(offset, offset + pageSize);
-  const names = shown.map(([, name], i) => `<b>${offset + i + 1}.</b> ${esc(name)}`);
-  const rows = shown.map(([cid], i) => [
-    { text: `📂 Курс №${offset + i + 1}`, callback_data: `course:${cid}` },
+  const names = shown.map(([, name]) => `• ${esc(name)}`);
+  const titles = shown.map(([, name]) => name);
+  const rows = shown.map(([cid, name]) => [
+    { text: `📂 ${courseButtonLabel(name, titles)}`, callback_data: `course:${cid}:${current}` },
     { text: muted.includes(cid) ? "🔕" : "🔔", callback_data: `c:${cid}` },
   ]);
   const nav = [];
@@ -384,7 +400,7 @@ function showCourses(env, chatId, catalog, key, muted, page = 0) {
   if (nav.length) rows.push(nav);
   const pageLabel = last ? ` · ${current + 1}/${last + 1}` : "";
   return send(env, chatId, `📚 Курсы группы <b>${group}</b>${pageLabel}\n\n${names.join("\n\n")}\n\n` +
-    "Кнопка с номером открывает курс. Колокольчик рядом управляет уведомлениями.",
+    "Нажмите название, чтобы открыть курс. Колокольчик рядом управляет уведомлениями.",
     { reply_markup: { inline_keyboard: rows } });
 }
 
@@ -401,9 +417,9 @@ function itemLink(item) {
   return /^https?:\/\//i.test(item.u || "") ? `<a href="${esc(item.u)}">${name}</a>` : name;
 }
 
-function courseMaterialRows(materials) {
+function courseMaterialRows(materials, coursesPage) {
   return materials.filter((m) => m.id && (m.u || m.f?.length)).map((m) => [
-    ...(m.f?.length ? [{ text: `📎 ${m.n.slice(0, 40)}`, callback_data: `files:${m.c}:${m.id}:0` }] : []),
+    ...(m.f?.length ? [{ text: `📎 ${m.n.slice(0, 40)}`, callback_data: `files:${m.c}:${m.id}:0:${coursesPage}` }] : []),
     ...(m.u ? [{ ...saveButton(`m:${m.id}`), text: m.f?.length ? "⭐" : `⭐ ${m.n.slice(0, 40)}` }] : []),
   ]);
 }
@@ -412,7 +428,7 @@ function courseMaterialLine(material) {
   return material.f?.length ? esc(material.n.slice(0, 100)) : itemLink(material);
 }
 
-async function courseMaterials(env, catalog, key, chatId, cid, page, filter) {
+async function courseMaterials(env, catalog, key, chatId, cid, page, filter, coursesPage) {
   const index = (await env.BOT_KV.get(`index:${key}`, "json")) || [];
   const query = { ktp: "ктп", brs: "брс" }[filter];
   const materials = index.filter((m) => m.c === cid &&
@@ -428,21 +444,21 @@ async function courseMaterials(env, catalog, key, chatId, cid, page, filter) {
     const filenames = (m.f || []).slice(0, 2).map((file) => esc(file.slice(0, 85)));
     return `• ${courseMaterialLine(m)}` + (filenames.length ? `\n   📎 ${filenames.join(", ")}` : "");
   });
-  const rows = courseMaterialRows(shown);
+  const rows = courseMaterialRows(shown, coursesPage);
   const nav = [];
-  if (current > 0) nav.push({ text: "← Назад", callback_data: `materials:${cid}:${filter}:${current - 1}` });
-  if (current < last) nav.push({ text: "Далее →", callback_data: `materials:${cid}:${filter}:${current + 1}` });
+  if (current > 0) nav.push({ text: "← Назад", callback_data: `materials:${cid}:${filter}:${current - 1}:${coursesPage}` });
+  if (current < last) nav.push({ text: "Далее →", callback_data: `materials:${cid}:${filter}:${current + 1}:${coursesPage}` });
   if (nav.length) rows.push(nav);
   rows.push([
-    { text: "Все", callback_data: `materials:${cid}:all:0` },
-    { text: "КТП", callback_data: `materials:${cid}:ktp:0` },
-    { text: "БРС", callback_data: `materials:${cid}:brs:0` },
-  ], [{ text: "К папке курса", callback_data: `course:${cid}` }]);
+    { text: "Все", callback_data: `materials:${cid}:all:0:${coursesPage}` },
+    { text: "КТП", callback_data: `materials:${cid}:ktp:0:${coursesPage}` },
+    { text: "БРС", callback_data: `materials:${cid}:brs:0:${coursesPage}` },
+  ], [{ text: "К папке курса", callback_data: `course:${cid}:${coursesPage}` }]);
   return send(env, chatId, `📂 <b>${name} · ${title}</b> · ${current + 1}/${last + 1}\n\n` +
     (lines.join("\n\n") || "Материалы не найдены."), { reply_markup: { inline_keyboard: rows } });
 }
 
-async function courseFolder(env, catalog, key, chatId, cid) {
+async function courseFolder(env, catalog, key, chatId, cid, coursesPage) {
   const name = (catalog.course_names[key] || {})[cid];
   const base = catalog.moodle_url || "https://on2026.econ.msu.ru";
   const [index, done] = await Promise.all([
@@ -465,8 +481,9 @@ async function courseFolder(env, catalog, key, chatId, cid) {
   const rows = [
     [{ text: "Открыть курс в Moodle", url: `${base}/course/view.php?id=${cid}` }],
     ...deadlines.map((d) => [{ ...saveButton(d.id), text: `⭐ ${d.name.slice(0, 40)}` }]),
-    [{ text: "Все материалы", callback_data: `materials:${cid}:all:0` }],
-    ...courseMaterialRows(materials),
+    [{ text: "Все материалы", callback_data: `materials:${cid}:all:0:${coursesPage}` }],
+    ...courseMaterialRows(materials, coursesPage),
+    [{ text: "← Назад к курсам", callback_data: `courses:${coursesPage}` }],
   ];
   return send(env, chatId, text, { reply_markup: { inline_keyboard: rows } });
 }
@@ -945,9 +962,9 @@ async function handleCallback(cq, catalog, env) {
     return sent;
   };
 
-  const fileAction = data.match(/^(files|file):(\d+):(\d+):(\d+)$/);
+  const fileAction = data.match(/^(files|file):(\d+):(\d+):(\d+)(?::(\d+))?$/);
   if (fileAction) {
-    const [, action, cid, mid, position] = fileAction;
+    const [, action, cid, mid, position, listPage = "0"] = fileAction;
     const group = sub?.g;
     if (!catalog.course_names[group]?.[cid]) return answer("Откройте актуальный список курсов");
     const index = (await env.BOT_KV.get(`index:${group}`, "json")) || [];
@@ -972,10 +989,10 @@ async function handleCallback(cq, catalog, env) {
       { text: `📎 ${path.split("/").pop().slice(0, 60)}`, callback_data: `file:${cid}:${mid}:${offset + i}` },
     ]);
     const nav = [];
-    if (offset > 0) nav.push({ text: "← Назад", callback_data: `files:${cid}:${mid}:${offset - 8}` });
-    if (offset + 8 < files.length) nav.push({ text: "Далее →", callback_data: `files:${cid}:${mid}:${offset + 8}` });
+    if (offset > 0) nav.push({ text: "← Назад", callback_data: `files:${cid}:${mid}:${offset - 8}:${listPage}` });
+    if (offset + 8 < files.length) nav.push({ text: "Далее →", callback_data: `files:${cid}:${mid}:${offset + 8}:${listPage}` });
     if (nav.length) rows.push(nav);
-    rows.push([{ text: "К папке курса", callback_data: `course:${cid}` }]);
+    rows.push([{ text: "К папке курса", callback_data: `course:${cid}:${listPage}` }]);
     await answer();
     return replaceMessage(send(env, chatId, `📎 <b>${esc(material.n.slice(0, 100))}</b>\nВыберите файл.`,
       { reply_markup: { inline_keyboard: rows } }));
@@ -989,20 +1006,20 @@ async function handleCallback(cq, catalog, env) {
     return replaceMessage(showCourses(env, chatId, catalog, key, sub.m || [], Number(coursesPage[1])));
   }
 
-  const folder = data.match(/^course:(\d+)$/);
+  const folder = data.match(/^course:(\d+)(?::(\d+))?$/);
   if (folder) {
     const key = sub?.g;
     if (!catalog.course_names[key]?.[folder[1]]) return answer("Откройте актуальный список курсов");
     await answer();
-    return replaceMessage(courseFolder(env, catalog, key, chatId, folder[1]));
+    return replaceMessage(courseFolder(env, catalog, key, chatId, folder[1], folder[2] || "0"));
   }
-  const materials = data.match(/^materials:(\d+):(all|ktp|brs):(\d+)$/);
+  const materials = data.match(/^materials:(\d+):(all|ktp|brs):(\d+)(?::(\d+))?$/);
   if (materials) {
-    const [, cid, filter, page] = materials;
+    const [, cid, filter, page, listPage = "0"] = materials;
     const key = sub?.g;
     if (!catalog.course_names[key]?.[cid]) return answer("Откройте актуальный список курсов");
     await answer();
-    return replaceMessage(courseMaterials(env, catalog, key, chatId, cid, Number(page), filter));
+    return replaceMessage(courseMaterials(env, catalog, key, chatId, cid, Number(page), filter, listPage));
   }
   const save = data.match(/^sv:((?:m|assign|quiz):\d+)$/);
   if (save) {
