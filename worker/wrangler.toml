@@ -7,6 +7,9 @@ main = "src/index.js"
 compatibility_date = "2025-01-01"
 workers_dev = true
 
+[assets]
+directory = "./public"
+
 [[kv_namespaces]]
 binding = "BOT_KV"
 id = "c209fda4d2ae468780e0bcf5646bc3b2"

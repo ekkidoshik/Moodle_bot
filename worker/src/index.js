@@ -30,6 +30,7 @@ const BTN_COURSES = "📚 Мои курсы";
 const BTN_DEADLINES = "⏰ Дедлайны";
 const BTN_SAVED = "⭐ Избранное";
 const BTN_SETTINGS = "⚙️ Настройки";
+const BTN_APP = "🎓 Мини-приложение";
 const BTN_SUPPORT = "💬 Связаться с поддержкой";
 const SUPPORT_PROMPT = "Напишите в поддержку ответом на это сообщение. Здесь можно задать вопрос или попросить добавить именно вашу группу в бота.";
 const REMINDER_OPTIONS = [[259200, "за 3 дня"], [86400, "за сутки"], [10800, "за 3 часа"], [3600, "за 1 час"]];
@@ -49,6 +50,10 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     ORIGIN = url.origin;
+
+    if (request.method === "GET" && url.pathname.startsWith("/mini-api/")) {
+      return miniAppData(request, url, env);
+    }
 
     // календарь: короткая ссылка /<группа>.ics и прежняя /calendar/<группа>/<токен>.ics
     const short = url.pathname.match(/^\/([a-z0-9_]+)\.ics$/);
@@ -218,6 +223,73 @@ function json(data) {
   return new Response(JSON.stringify(data), { headers: { "content-type": "application/json" } });
 }
 
+async function telegramMiniUser(header, token) {
+  if (!header?.startsWith("tma ") || !token) return null;
+  const params = new URLSearchParams(header.slice(4));
+  const hash = params.get("hash");
+  const age = Date.now() / 1000 - Number(params.get("auth_date"));
+  if (!hash || !/^[a-f0-9]{64}$/.test(hash) || !Number.isFinite(age) || age < -60 || age > 3600) return null;
+  params.delete("hash");
+  if (new Set(params.keys()).size !== params.size) return null;
+  params.sort();
+  const encoder = new TextEncoder();
+  const hmac = { name: "HMAC", hash: "SHA-256" };
+  const base = await crypto.subtle.importKey("raw", encoder.encode("WebAppData"), hmac, false, ["sign"]);
+  const secret = await crypto.subtle.sign("HMAC", base, encoder.encode(token));
+  const key = await crypto.subtle.importKey("raw", secret, hmac, false, ["verify"]);
+  const signature = Uint8Array.from(hash.match(/../g), (hex) => parseInt(hex, 16));
+  const data = Array.from(params, ([name, value]) => `${name}=${value}`).join("\n");
+  if (!await crypto.subtle.verify("HMAC", key, signature, encoder.encode(data))) return null;
+  try {
+    const user = JSON.parse(params.get("user"));
+    return Number.isSafeInteger(user?.id) && user.id > 0 ? user : null;
+  } catch {
+    return null;
+  }
+}
+
+async function miniAppData(request, url, env) {
+  const respond = (data, status = 200) => Response.json(data, {
+    status, headers: { "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff" },
+  });
+  const user = await telegramMiniUser(request.headers.get("Authorization"), env.TELEGRAM_BOT_TOKEN);
+  if (!user) return respond({ error: "Откройте мини-приложение заново из Telegram." }, 401);
+  const chatId = String(user.id);
+  const [catalog, sub] = await Promise.all([getCatalog(env), getSub(env, chatId)]);
+  if (!catalog) return respond({ error: "Каталог Moodle ещё загружается." }, 503);
+  const group = catalog.groups.find((g) => g.key === sub?.g);
+  const route = url.pathname.slice("/mini-api/".length);
+  if (!group) return route === "overview"
+    ? respond({ group: null }) : respond({ error: "Сначала выберите группу в боте." }, 403);
+
+  const names = catalog.course_names[group.key] || {};
+  if (route === "overview") {
+    const done = new Set(await getDone(env, chatId));
+    const now = Date.now() / 1000;
+    const courses = Object.entries(names).map(([id, name]) => ({ id, name, muted: (sub.m || []).includes(id) }));
+    const deadlines = (catalog.deadlines[group.key] || [])
+      .filter((d) => d.due > now && !done.has(d.id) && !(sub.m || []).includes(d.course) && Object.hasOwn(names, d.course))
+      .map(({ name, course, kind, due, url }) => ({ name, course, kind, due, url }))
+      .sort((a, b) => a.due - b.due);
+    return respond({ firstName: user.first_name, group: group.title, courses, deadlines });
+  }
+  if (route !== "materials") return respond({ error: "Страница не найдена." }, 404);
+  const course = url.searchParams.get("course");
+  if (course && !Object.hasOwn(names, course)) return respond({ error: "Курс недоступен." }, 404);
+  const words = norm((url.searchParams.get("q") || "").trim().slice(0, 120)).split(/\s+/).filter(Boolean);
+  if (!course && !words.length) return respond({ items: [], more: false });
+  const index = (await env.BOT_KV.get(`index:${group.key}`, "json")) || [];
+  const items = index.filter((m) => Object.hasOwn(names, m.c) && (!course || m.c === course) &&
+    (!words.length || words.every((word) => norm([m.n, ...(m.f || [])].join(" ")).includes(word))))
+    .sort((a, b) => (b.t || 0) - (a.t || 0));
+  const page = Math.max(0, Math.min(1000, parseInt(url.searchParams.get("page"), 10) || 0));
+  const offset = page * 24;
+  return respond({
+    items: items.slice(offset, offset + 24).map((m) => ({ name: m.n, url: m.u, course: names[m.c], files: (m.f || []).slice(0, 3) })),
+    more: items.length > offset + 24,
+  });
+}
+
 async function getCatalog(env) {
   return await env.BOT_KV.get("catalog", "json");
 }
@@ -319,6 +391,7 @@ function mainKeyboard() {
     keyboard: [
       [{ text: BTN_COURSES }, { text: BTN_DEADLINES }],
       [{ text: BTN_SETTINGS }, { text: BTN_SAVED }],
+      [{ text: BTN_APP }],
       [{ text: BTN_SUPPORT }],
     ],
     resize_keyboard: true,
@@ -845,6 +918,12 @@ async function handleMessage(msg, catalog, env, origin) {
   const chatId = String(msg.chat.id);
   const text = (msg.text || "").trim();
   const command = text.startsWith("/") ? text.split(/\s+/)[0].split("@")[0].toLowerCase() : "";
+
+  if (msg.chat.type === "private" && (command === "/app" || text === BTN_APP)) {
+    return send(env, chatId, "Курсы, дедлайны и материалы в одном месте.", {
+      reply_markup: { inline_keyboard: [[{ text: "Открыть мини-приложение", web_app: { url: `${origin}/app/` } }]] },
+    });
+  }
 
   if (msg.chat.type === "private" && catalog && isAdmin(catalog, chatId)) {
     if (command === "/refresh_keyboard") {

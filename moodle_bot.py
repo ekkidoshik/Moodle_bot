@@ -61,7 +61,7 @@ RENAMED_GROUPS = {"my-group": "m104"}
 
 # Команды бота: ключи групп не должны с ними совпадать.
 RESERVED_COMMANDS = {"start", "stop", "courses", "deadlines", "search", "settings",
-                     "stats", "broadcast", "calendar", "id", "support", "support_setup", "refresh_keyboard"}
+                     "stats", "broadcast", "calendar", "id", "support", "support_setup", "refresh_keyboard", "app"}
 BTN_COURSES = "📚 Мои курсы"
 BTN_DEADLINES = "⏰ Дедлайны"
 BTN_SETTINGS = "⚙️ Настройки"
@@ -429,6 +429,7 @@ def setup_bot_profile(groups, state):
         commands[-1:-1] = [
             {"command": "saved", "description": "Избранное"},
             {"command": "support", "description": "Связаться с поддержкой"},
+            {"command": "app", "description": "Открыть мини-приложение"},
         ]
     description = (
         "Присылаю новые и обновлённые файлы из курсов Moodle вашей группы, напоминаю "
