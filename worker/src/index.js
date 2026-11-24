@@ -34,7 +34,8 @@ const BTN_APP = "🎓 Мини-приложение";
 const BTN_SUPPORT = "💬 Поддержка";
 const OLD_BTN_SUPPORT = "💬 Связаться с поддержкой";
 const UPLOAD_PROMPT = "Выберите группы, затем нажмите «Разослать файл».";
-const STUDENT_FILE_PROMPT = "Прикрепите документ ответом на это сообщение. Можно добавить подпись к файлу. После этого выберите группы для рассылки.";
+const LEGACY_STUDENT_FILE_PROMPT = "Прикрепите документ ответом на это сообщение. Можно добавить подпись к файлу. После этого выберите группы для рассылки.";
+const STUDENT_FILE_PROMPT = "Прикрепите файл через скрепку и выберите «Файл». Можно добавить подпись. После отправки бот предложит выбрать группы.";
 const STUDENT_GROUP_PROMPT = "Выберите группы, затем нажмите «На проверку». Файл увидит администратор.";
 const REVIEW_PROMPT = "Файл на модерации. Проверьте документ и группы перед рассылкой.";
 const SUPPORT_PROMPT = "Напишите в поддержку ответом на это сообщение. Здесь можно задать вопрос или попросить добавить именно вашу группу в бота.";
@@ -1074,16 +1075,21 @@ async function handleMessage(msg, catalog, env, origin) {
   if (msg.chat.type === "private" && command === "/submit_file") {
     return requestStudentFile(env, chatId);
   }
-  if (!command && msg.chat.type === "private" && replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) === STUDENT_FILE_PROMPT) {
-    if (!msg.document?.file_id) return requestStudentFile(env, chatId);
+  const admin = msg.chat.type === "private" && catalog && isAdmin(catalog, chatId);
+  const prompt = msg.chat.type === "private" ? replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) : null;
+  const studentFileReply = prompt === STUDENT_FILE_PROMPT || prompt === LEGACY_STUDENT_FILE_PROMPT;
+  if (msg.chat.type === "private" && msg.document?.file_id && (!admin || studentFileReply)) {
     if (!catalog?.groups?.length) return send(env, chatId, "Группы пока недоступны. Попробуйте позже.");
     return send(env, chatId, STUDENT_GROUP_PROMPT, {
       reply_parameters: { message_id: msg.message_id },
       reply_markup: uploadKeyboard(catalog, [], "На проверку"),
     });
   }
+  if (!command && (studentFileReply || (msg.chat.type === "private" && msg.photo?.length))) {
+    return send(env, chatId, "Пришлите вложение как документ: скрепка → «Файл».");
+  }
 
-  if (msg.chat.type === "private" && catalog && isAdmin(catalog, chatId)) {
+  if (admin) {
     if (command === "/upload") return send(env, chatId, "Пришлите документ, затем выберите группы для рассылки. К файлу можно добавить подпись.");
     if (command === "/refresh_keyboard") {
       return broadcastToSubscribers(env, catalog, chatId, null,
@@ -1102,7 +1108,7 @@ async function handleMessage(msg, catalog, env, origin) {
   if (msg.chat.type === "private" && (command === "/support" || text === BTN_SUPPORT || text === OLD_BTN_SUPPORT)) {
     return supportMenu(env, chatId);
   }
-  if (command !== "/start" && msg.chat.type === "private" && replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) === SUPPORT_PROMPT) {
+  if (command !== "/start" && prompt === SUPPORT_PROMPT) {
     return submitSupport(msg, catalog, env);
   }
 

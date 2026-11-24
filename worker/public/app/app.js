@@ -112,7 +112,7 @@ function showSupport() {
     status.textContent = "Открываем чат для загрузки файла…";
     try {
       await api("support", {}, { uploadAccess: true });
-      status.textContent = "Прикрепите файл ответом на сообщение в чате Moodle-бота.";
+      status.textContent = "Прикрепите документ через скрепку в чате Moodle-бота.";
       telegram.close();
     } catch (error) {
       propose.disabled = false;
