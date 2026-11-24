@@ -32,6 +32,8 @@ const BTN_SAVED = "⭐ Избранное";
 const BTN_SETTINGS = "⚙️ Настройки";
 const BTN_APP = "🎓 Мини-приложение";
 const BTN_SUPPORT = "💬 Связаться с поддержкой";
+const UPLOAD_ACCESS = "Запросить доступ для размещения своих файлов в бота";
+const UPLOAD_PROMPT = "Выберите группы, затем нажмите «Разослать файл».";
 const SUPPORT_PROMPT = "Напишите в поддержку ответом на это сообщение. Здесь можно задать вопрос или попросить добавить именно вашу группу в бота.";
 const REMINDER_OPTIONS = [[259200, "за 3 дня"], [86400, "за сутки"], [10800, "за 3 часа"], [3600, "за 1 час"]];
 const DEFAULT_REMINDERS = [86400, 10800];
@@ -279,7 +281,8 @@ async function miniAppData(request, url, env) {
   if (!catalog) return respond({ error: "Каталог Moodle ещё загружается." }, 503);
   const body = request.method === "POST" ? await request.json().catch(() => null) : null;
   if (route === "support" && request.method === "POST") {
-    const message = typeof body?.text === "string" ? body.text.trim() : "";
+    const message = body?.uploadAccess === true ? UPLOAD_ACCESS :
+      typeof body?.text === "string" ? body.text.trim() : "";
     if (!message || message.length > 3500) return respond({ error: "Введите сообщение до 3500 символов." }, 400);
     const ok = await forwardSupport(env, catalog, previous, chatId, Date.now(), message);
     return ok ? respond({ ok: true }) : respond({ error: "Не удалось отправить сообщение. Попробуйте позже." }, 502);
@@ -835,7 +838,10 @@ function isAdmin(catalog, chatId) {
   return !!(catalog.admin && String(catalog.admin).trim() === chatId);
 }
 
-function supportPrompt(env, chatId) {
+async function supportPrompt(env, chatId, showAccess = true) {
+  if (showAccess) await send(env, chatId, "Можно запросить доступ для публикации файлов своей группы.", {
+    reply_markup: { inline_keyboard: [[{ text: UPLOAD_ACCESS, callback_data: "support_upload" }]] },
+  });
   return send(env, chatId, SUPPORT_PROMPT, {
     reply_markup: { force_reply: true, input_field_placeholder: "Сообщение для поддержки" },
   });
@@ -859,7 +865,7 @@ async function submitSupport(msg, catalog, env) {
   const text = msg.text?.trim();
   if (!text || text.length > 3500) {
     await send(env, chatId, "Поддержка принимает текст до 3500 символов.");
-    return supportPrompt(env, chatId);
+    return supportPrompt(env, chatId, false);
   }
   const sub = await getSub(env, chatId);
   const ok = await forwardSupport(env, catalog, sub, chatId, msg.message_id, text);
@@ -945,33 +951,55 @@ async function statsText(env, catalog) {
 async function broadcastCommand(env, catalog, chatId, text) {
   const rest = text.replace(/^\/broadcast(@\S+)?\s*/i, "");
   const first = rest.split(/\s+/)[0].toLowerCase();
-  const group = catalog.groups.some((g) => g.key === first) ? first : null;
+  const keys = catalog.groups.map((g) => g.key);
+  const requested = first.split(",");
+  const multiple = requested.length > 1 &&
+    (requested.some((key) => keys.includes(key)) || requested.every((key) => /^[a-z0-9_]+$/.test(key)));
+  if (multiple && requested.some((key) => !keys.includes(key))) {
+    return send(env, chatId, "Проверьте ключи групп и укажите их через запятую без пробелов.");
+  }
+  const group = multiple ? [...new Set(requested)] : keys.includes(first) ? first : null;
   const body = (group ? rest.slice(first.length) : rest).trim();
   if (!body) {
-    const keys = catalog.groups.map((g) => g.key).join(", ");
     return send(env, chatId,
       "Использование:\n<code>/broadcast текст</code> — всем подписчикам\n" +
-      `<code>/broadcast m104 текст</code> — одной группе (ключи: ${esc(keys)})`);
+      `<code>/broadcast m104,m105 текст</code> — выбранным группам (ключи: ${esc(keys.join(", "))})`);
   }
   return broadcastToSubscribers(env, catalog, chatId, group, body);
 }
 
 async function broadcastToSubscribers(env, catalog, chatId, group, body, options = {}) {
   const subs = await listSubscribers(env);
-  const targets = Object.entries(subs).filter(([, s]) => !group || s.group === group).map(([c]) => c);
-  const whom = group ? `группе ${esc(groupTitle(catalog, group))}` : "всем";
+  const groups = Array.isArray(group) ? group : group ? [group] : [];
+  const targets = Object.entries(subs).filter(([, s]) => !groups.length || groups.includes(s.group)).map(([c]) => c);
+  const whom = groups.length ? groups.map((key) => esc(groupTitle(catalog, key))).join(", ") : "всем";
+  const { document, ...messageOptions } = options;
   if (targets.length <= DIRECT_BROADCAST_LIMIT) {
     let ok = 0;
     for (const c of targets) {
-      const r = await tg(env, "sendMessage", { chat_id: c, text: body, disable_web_page_preview: true, ...options });
+      const r = document
+        ? await tg(env, "sendDocument", { chat_id: c, document, caption: body })
+        : await tg(env, "sendMessage", { chat_id: c, text: body, disable_web_page_preview: true, ...messageOptions });
       if (r.ok) ok++;
     }
     return send(env, chatId, `📣 Отправлено ${whom}: ${ok} из ${targets.length}.`);
   }
   const queue = (await env.BOT_KV.get("broadcasts", "json")) || [];
-  queue.push({ group, text: body, ...options });
+  queue.push({ group: typeof group === "string" ? group : null,
+    ...(Array.isArray(group) ? { groups } : {}), text: body, ...options });
   await env.BOT_KV.put("broadcasts", JSON.stringify(queue));
   return send(env, chatId, `📣 Получателей ${targets.length} (${whom}) — разошлю при ближайшей проверке, в течение ${checkEvery(catalog)} минут.`);
+}
+
+function uploadKeyboard(catalog, selected = []) {
+  const buttons = catalog.groups.map(({ key, title }) => ({
+    text: `${selected.includes(key) ? "✅ " : "▫️ "}${title}`, callback_data: `upload_group:${key}`,
+  }));
+  const rows = [];
+  for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
+  rows.push([{ text: "Разослать файл", callback_data: "upload_send" },
+    { text: "Отмена", callback_data: "upload_cancel" }]);
+  return { inline_keyboard: rows };
 }
 
 // ------------------------------ Обработка ------------------------------
@@ -1008,6 +1036,7 @@ async function handleMessage(msg, catalog, env, origin) {
   }
 
   if (msg.chat.type === "private" && catalog && isAdmin(catalog, chatId)) {
+    if (command === "/upload") return send(env, chatId, "Пришлите документ, затем выберите группы для рассылки. К файлу можно добавить подпись.");
     if (command === "/refresh_keyboard") {
       return broadcastToSubscribers(env, catalog, chatId, null,
         "Меню бота обновилось. Теперь в нём есть кнопка «Связаться с поддержкой».",
@@ -1015,6 +1044,12 @@ async function handleMessage(msg, catalog, env, origin) {
     }
     if (command === "/support_setup") return setupSupportWebhook(env, chatId, origin);
     if (await handleSupportReply(msg, env, env.TELEGRAM_BOT_TOKEN)) return;
+    if (msg.document?.file_id && catalog.groups.length) {
+      return send(env, chatId, UPLOAD_PROMPT, {
+        reply_parameters: { message_id: msg.message_id },
+        reply_markup: uploadKeyboard(catalog),
+      });
+    }
   }
   if (msg.chat.type === "private" && (command === "/support" || text === BTN_SUPPORT)) {
     return supportPrompt(env, chatId);
@@ -1115,6 +1150,37 @@ async function handleCallback(cq, catalog, env) {
 
   const chatId = String(msg.chat.id);
   const sub = await getSub(env, chatId);
+  if (data === "support_upload" && msg.chat.type === "private") {
+    await answer();
+    const ok = await forwardSupport(env, catalog, sub, chatId, Date.now(), UPLOAD_ACCESS);
+    return send(env, chatId, ok ? "Запрос отправлен. Ответ придёт сюда." : "Не удалось отправить запрос. Попробуйте позже.");
+  }
+  if (data.startsWith("upload_")) {
+    if (msg.chat.type !== "private" || !isAdmin(catalog, chatId) || String(cq.from?.id) !== chatId) {
+      return answer("Размещение файлов доступно администратору.");
+    }
+    const source = msg.reply_to_message;
+    if (msg.text !== UPLOAD_PROMPT || !source?.document?.file_id || String(source.from?.id) !== chatId) {
+      return answer("Пришлите файл заново.");
+    }
+    const selected = (msg.reply_markup?.inline_keyboard || []).flat()
+      .filter((button) => button.callback_data?.startsWith("upload_group:") && button.text.startsWith("✅ "))
+      .map((button) => button.callback_data.slice("upload_group:".length))
+      .filter((key) => catalog.groups.some((group) => group.key === key));
+    const edit = (reply_markup) => tg(env, "editMessageReplyMarkup", { chat_id: chatId, message_id: msg.message_id, reply_markup });
+    if (data.startsWith("upload_group:")) {
+      const key = data.slice("upload_group:".length);
+      if (!catalog.groups.some((group) => group.key === key)) return answer("Группа больше недоступна.");
+      await answer();
+      return edit(uploadKeyboard(catalog, selected.includes(key) ? selected.filter((value) => value !== key) : [...selected, key]));
+    }
+    if (data === "upload_send" && !selected.length) return answer("Выберите хотя бы одну группу.");
+    if (data !== "upload_send" && data !== "upload_cancel") return answer();
+    await answer(data === "upload_cancel" ? "Отменено" : "Рассылаю файл…");
+    const locked = await edit({ inline_keyboard: [] });
+    if (!locked.ok || data === "upload_cancel") return;
+    return broadcastToSubscribers(env, catalog, chatId, selected, source.caption || "", { document: source.document.file_id });
+  }
   const replaceMessage = async (replacement) => {
     const sent = await replacement;
     if (sent.ok) {

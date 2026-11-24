@@ -115,6 +115,19 @@ function showSupport() {
   const status = element("p", "settings-status");
   status.setAttribute("role", "status");
   const form = element("form", "settings-card", element("label", "group-label", "Сообщение", input), submit, status);
+  const accessStatus = element("p", "settings-status");
+  accessStatus.setAttribute("role", "status");
+  const access = button("Запросить доступ для размещения своих файлов в бота", "row secondary", async () => {
+    access.disabled = true;
+    accessStatus.textContent = "Отправляем запрос…";
+    try {
+      await api("support", {}, { uploadAccess: true });
+      accessStatus.textContent = "Запрос отправлен. Ответ придёт в чат Moodle-бота.";
+    } catch (error) {
+      access.disabled = false;
+      accessStatus.textContent = error.message;
+    }
+  });
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const text = input.value.trim();
@@ -132,7 +145,8 @@ function showSupport() {
     }
   });
   view.replaceChildren(heading("Поддержка"),
-    element("p", "settings-intro", "Здесь можно задать вопрос или попросить добавить свою группу в бота."), form);
+    element("p", "settings-intro", "Здесь можно задать вопрос или попросить добавить свою группу в бота."),
+    form, access, accessStatus);
 }
 
 function itemRow(item, meta, action) {

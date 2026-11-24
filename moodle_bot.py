@@ -61,7 +61,7 @@ RENAMED_GROUPS = {"my-group": "m104"}
 
 # Команды бота: ключи групп не должны с ними совпадать.
 RESERVED_COMMANDS = {"start", "stop", "courses", "deadlines", "search", "settings",
-                     "stats", "broadcast", "calendar", "id", "support", "support_setup", "refresh_keyboard", "app"}
+                     "stats", "broadcast", "calendar", "id", "support", "support_setup", "refresh_keyboard", "app", "upload"}
 BTN_COURSES = "📚 Мои курсы"
 BTN_DEADLINES = "⏰ Дедлайны"
 BTN_SETTINGS = "⚙️ Настройки"
@@ -751,15 +751,22 @@ def sync_telegram(groups, state):
 
     # рассылки /broadcast, которые Worker не успел отправить сам (много получателей)
     for b in relay("POST", "/api/broadcasts/take"):
+        target_groups = b.get("groups") or ([b["group"]] if b.get("group") else [])
         chats = [c for c, g in state["subscribers"].items()
-                 if not b.get("group") or g == b["group"]]
+                 if not target_groups or g in target_groups]
         options = {key: b[key] for key in ("reply_markup", "disable_notification") if key in b}
+        sent = 0
         for chat_id in chats:
             try:
-                send_message(chat_id, b["text"], html_mode=False, **options)
+                if b.get("document"):
+                    tg("sendDocument", chat_id=chat_id, document=b["document"], caption=b["text"])
+                    time.sleep(0.05)
+                else:
+                    send_message(chat_id, b["text"], html_mode=False, **options)
+                sent += 1
             except (TelegramError, requests.RequestException) as e:
                 log.warning("Рассылка в %s не ушла: %s", mask(chat_id), e)
-        log.info("Рассылка отправлена: %d получателей", len(chats))
+        log.info("Рассылка отправлена: %d из %d получателей", sent, len(chats))
 
     process_file_requests(groups, state)
 
