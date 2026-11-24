@@ -443,13 +443,20 @@ def setup_bot_profile(groups, state):
                         "подтверждение придёт при следующей проверке.")
     short = "Новые файлы, дедлайны и поиск по Moodle вашей группы. Нажмите «Начать»."
 
-    signature = json.dumps([commands, description, short], ensure_ascii=False, sort_keys=True)
+    menu_button = {"type": "commands"}
+    if relay_enabled():
+        menu_button = {
+            "type": "web_app", "text": "Открыть приложение",
+            "web_app": {"url": RELAY_URL.rstrip("/") + "/app/"},
+        }
+    signature = json.dumps([commands, description, short, menu_button], ensure_ascii=False, sort_keys=True)
     if state.get("bot_profile") == signature:
         return
     try:
         tg("setMyCommands", commands=commands)
         tg("setMyDescription", description=description)
         tg("setMyShortDescription", short_description=short)
+        tg("setChatMenuButton", menu_button=menu_button)
     except (TelegramError, requests.RequestException) as e:
         log.warning("Не удалось обновить меню/описание бота: %s", e)
         return

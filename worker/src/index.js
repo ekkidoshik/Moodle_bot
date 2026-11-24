@@ -51,7 +51,8 @@ export default {
     const url = new URL(request.url);
     ORIGIN = url.origin;
 
-    if (request.method === "GET" && url.pathname.startsWith("/mini-api/")) {
+    if ((request.method === "GET" && url.pathname.startsWith("/mini-api/")) ||
+        (request.method === "POST" && url.pathname === "/mini-api/group")) {
       return miniAppData(request, url, env);
     }
 
@@ -255,15 +256,28 @@ async function miniAppData(request, url, env) {
   const user = await telegramMiniUser(request.headers.get("Authorization"), env.TELEGRAM_BOT_TOKEN);
   if (!user) return respond({ error: "Откройте мини-приложение заново из Telegram." }, 401);
   const chatId = String(user.id);
-  const [catalog, sub] = await Promise.all([getCatalog(env), getSub(env, chatId)]);
+  const [catalog, previous] = await Promise.all([getCatalog(env), getSub(env, chatId)]);
   if (!catalog) return respond({ error: "Каталог Moodle ещё загружается." }, 503);
-  const group = catalog.groups.find((g) => g.key === sub?.g);
   const route = url.pathname.slice("/mini-api/".length);
+  let sub = previous;
+  if (request.method === "POST") {
+    const body = await request.json().catch(() => null);
+    if (!catalog.groups.some((g) => g.key === body?.group)) {
+      return respond({ error: "Выберите группу из списка." }, 400);
+    }
+    if (previous?.g !== body.group) {
+      sub = { ...previous, g: body.group, m: [] };
+      await putSub(env, chatId, sub);
+    }
+  }
+  const group = catalog.groups.find((g) => g.key === sub?.g);
+  const profile = { firstName: user.first_name, group: group?.title ?? null,
+    groupKey: group?.key ?? null, groups: catalog.groups.map(({ key, title }) => ({ key, title })) };
   if (!group) return route === "overview"
-    ? respond({ group: null }) : respond({ error: "Сначала выберите группу в боте." }, 403);
+    ? respond({ ...profile, courses: [], deadlines: [] }) : respond({ error: "Сначала выберите группу." }, 403);
 
   const names = catalog.course_names[group.key] || {};
-  if (route === "overview") {
+  if (route === "overview" || request.method === "POST") {
     const done = new Set(await getDone(env, chatId));
     const now = Date.now() / 1000;
     const courses = Object.entries(names).map(([id, name]) => ({ id, name, muted: (sub.m || []).includes(id) }));
@@ -271,7 +285,7 @@ async function miniAppData(request, url, env) {
       .filter((d) => d.due > now && !done.has(d.id) && !(sub.m || []).includes(d.course) && Object.hasOwn(names, d.course))
       .map(({ name, course, kind, due, url }) => ({ name, course, kind, due, url }))
       .sort((a, b) => a.due - b.due);
-    return respond({ firstName: user.first_name, group: group.title, courses, deadlines });
+    return respond({ ...profile, courses, deadlines });
   }
   if (route !== "materials") return respond({ error: "Страница не найдена." }, 404);
   const course = url.searchParams.get("course");
@@ -391,7 +405,6 @@ function mainKeyboard() {
     keyboard: [
       [{ text: BTN_COURSES }, { text: BTN_DEADLINES }],
       [{ text: BTN_SETTINGS }, { text: BTN_SAVED }],
-      [{ text: BTN_APP }],
       [{ text: BTN_SUPPORT }],
     ],
     resize_keyboard: true,

@@ -2,6 +2,7 @@ const telegram = window.Telegram?.WebApp;
 const view = document.querySelector("#view");
 const tabs = document.querySelector("#tabs");
 const group = document.querySelector("#group");
+const settings = document.querySelector("#settings");
 const dateFormat = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "short", timeZone: "Europe/Moscow" });
 const timeFormat = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Moscow" });
 let overview;
@@ -50,10 +51,13 @@ function externalRow(url, className, ...content) {
   return link;
 }
 
-async function api(path, params = {}) {
+async function api(path, params = {}, payload) {
   const query = new URLSearchParams(params);
   const response = await fetch(`/mini-api/${path}?${query}`, {
-    headers: { Authorization: `tma ${telegram.initData}` },
+    method: payload ? "POST" : "GET",
+    headers: { Authorization: `tma ${telegram.initData}`,
+      ...(payload ? { "Content-Type": "application/json" } : {}) },
+    body: payload ? JSON.stringify(payload) : undefined,
     cache: "no-store",
   });
   const data = await response.json();
@@ -86,6 +90,59 @@ function stat(value, label, target) {
   return button(element("span", "", element("strong", "", String(value)), label), "stat", () => switchTab(target));
 }
 
+function applyOverview(data) {
+  overview = data;
+  group.textContent = data.group || "";
+  group.hidden = !data.group;
+  tabs.hidden = !data.group;
+  settings.hidden = false;
+}
+
+function showSettings() {
+  const select = element("select", "group-select");
+  const placeholder = element("option", "", "Выберите группу");
+  placeholder.value = "";
+  placeholder.disabled = true;
+  select.append(placeholder);
+  for (const item of overview.groups) {
+    const option = element("option", "", item.title);
+    option.value = item.key;
+    select.append(option);
+  }
+  select.value = overview.groupKey || "";
+  const submit = element("button", "primary more", "Сохранить");
+  submit.type = "submit";
+  const status = element("p", "settings-status");
+  status.setAttribute("role", "status");
+  const label = element("label", "group-label", "Учебная группа", select);
+  const form = element("form", "settings-card", label, submit, status);
+  const updateSubmit = () => { submit.disabled = !select.value || select.value === overview.groupKey; };
+  updateSubmit();
+  select.addEventListener("change", updateSubmit);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (submit.disabled) return;
+    select.disabled = submit.disabled = true;
+    settings.disabled = true;
+    tabs.inert = true;
+    telegram?.BackButton?.hide();
+    status.textContent = "Сохраняем группу…";
+    try {
+      applyOverview(await api("group", {}, { group: select.value }));
+      switchTab("home");
+    } catch (error) {
+      status.textContent = error.message;
+      if (overview.group) telegram?.BackButton?.show();
+    } finally {
+      select.disabled = settings.disabled = tabs.inert = false;
+      updateSubmit();
+    }
+  });
+  view.replaceChildren(heading(overview.group ? "Настройки" : "Выберите группу"),
+    element("p", "settings-intro", "Курсы, дедлайны и уведомления бота будут относиться к выбранной группе."),
+    form);
+}
+
 function switchTab(tab) {
   navigation++;
   for (const node of tabs.querySelectorAll("button")) {
@@ -95,9 +152,12 @@ function switchTab(tab) {
   telegram?.BackButton?.hide();
   window.scrollTo(0, 0);
 
-  if (tab === "home") {
+  if (tab === "settings") {
+    if (overview.group) telegram?.BackButton?.show();
+    showSettings();
+  } else if (tab === "home") {
     view.replaceChildren(
-      element("section", "hero", element("p", "eyebrow", "УЧЕБНЫЙ КАБИНЕТ"),
+      element("section", "hero", element("p", "eyebrow", "МОЙ MOODLE"),
         heading(overview.firstName ? `Привет, ${overview.firstName}!` : "Учёба под рукой"),
         element("p", "", "Курсы и дедлайны вашей группы")),
       element("div", "summary", stat(overview.courses.length, "Курсы", "courses"),
@@ -172,31 +232,28 @@ async function showMaterials(container, params, version, page = 0) {
 async function start() {
   telegram?.ready();
   telegram?.expand();
-  telegram?.BackButton?.onClick(() => switchTab("courses"));
   if (!telegram?.initData) {
     view.replaceChildren(element("section", "hero", heading("Учёба под рукой"),
       element("p", "", "Откройте мини-приложение через команду /app в Telegram-боте Moodle.")));
     return;
   }
   try {
-    overview = await api("overview");
-    if (!overview.group) {
-      view.replaceChildren(heading("Выберите группу"), notice("Вернитесь в чат бота и выберите свою группу через /start."),
-        button("Вернуться в бот", "primary more", () => telegram.close()));
-      return;
-    }
-    group.textContent = overview.group;
-    group.hidden = false;
-    tabs.hidden = false;
-    tabs.addEventListener("click", (event) => {
-      const tab = event.target.closest("button[data-tab]")?.dataset.tab;
-      if (tab) switchTab(tab);
-    });
-    switchTab("home");
+    applyOverview(await api("overview"));
+    switchTab(overview.group ? "home" : "settings");
   } catch (error) {
     view.replaceChildren(heading("Не удалось открыть кабинет"), notice(error.message),
       button("Повторить", "primary more", start));
   }
 }
+
+tabs.addEventListener("click", (event) => {
+  const tab = event.target.closest("button[data-tab]")?.dataset.tab;
+  if (tab) switchTab(tab);
+});
+settings.addEventListener("click", () => switchTab("settings"));
+telegram?.BackButton?.onClick(() => {
+  if (!overview?.group || settings.disabled) return;
+  switchTab(tabs.querySelector('[aria-current="page"]') ? "courses" : "home");
+});
 
 start();
