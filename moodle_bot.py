@@ -62,7 +62,7 @@ RENAMED_GROUPS = {"my-group": "m104"}
 # Команды бота: ключи групп не должны с ними совпадать.
 RESERVED_COMMANDS = {"start", "stop", "courses", "deadlines", "search", "settings",
                      "stats", "broadcast", "calendar", "id", "support", "support_setup", "refresh_keyboard",
-                     "app", "upload", "submit_file"}
+                     "app", "upload", "submit_file", "menu"}
 BTN_COURSES = "📚 Мои курсы"
 BTN_DEADLINES = "⏰ Дедлайны"
 BTN_SETTINGS = "⚙️ Настройки"
@@ -419,6 +419,7 @@ def setup_bot_profile(groups, state):
     """Меню команд и описание бота. Отправляем в Telegram, только если что-то изменилось."""
     commands = [
         {"command": "start", "description": "Открыть меню бота"},
+        {"command": "menu", "description": "Показать клавиатуру"},
         {"command": "courses", "description": "Мои курсы и отключение ненужных"},
         {"command": "deadlines", "description": "Ближайшие дедлайны"},
         {"command": "search", "description": "Поиск по материалам курсов"},
@@ -604,7 +605,9 @@ def handle_message(msg, groups, state):
     command = text.split()[0].split("@")[0].lower() if text.startswith("/") else ""
     current = state["subscribers"].get(chat_id)
 
-    if command == "/start":
+    if command == "/menu":
+        send_message(chat_id, "Меню бота", reply_markup=main_keyboard())
+    elif command == "/start":
         if current in groups:
             send_message(chat_id,
                          f"Сейчас вы подписаны на группу <b>{html.escape(groups[current]['title'])}</b>. "
@@ -1247,6 +1250,15 @@ def run(groups, state):
         sync_error = f"{type(e).__name__}: {e}"
         log.error("Не удалось получить сообщения/подписчиков: %s", e)
     if relay_enabled() and sync_error is None:
+        if ADMIN_CHAT_ID and not state.get("admin_keyboard_restored"):
+            try:
+                keyboard = relay("GET", "/api/main-keyboard")
+                send_message(ADMIN_CHAT_ID, "Клавиатура бота восстановлена.",
+                             reply_markup=keyboard, disable_notification=True)
+                state["admin_keyboard_restored"] = True
+                log.info("Клавиатура администратора восстановлена")
+            except (TelegramError, requests.RequestException, ValueError) as e:
+                log.warning("Не удалось восстановить клавиатуру администратора: %s", e)
         try:
             refresh_subscriber_keyboards(state)
         except (requests.RequestException, ValueError) as e:

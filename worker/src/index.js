@@ -463,6 +463,7 @@ function mainKeyboard() {
     ],
     resize_keyboard: true,
     is_persistent: true,
+    one_time_keyboard: false,
   };
 }
 
@@ -1054,6 +1055,10 @@ async function handleMessage(msg, catalog, env, origin) {
   const text = (msg.text || "").trim();
   const command = text.startsWith("/") ? text.split(/\s+/)[0].split("@")[0].toLowerCase() : "";
 
+  if (msg.chat.type === "private" && command === "/menu") {
+    return send(env, chatId, "Меню бота", { reply_markup: mainKeyboard() });
+  }
+
   if (msg.chat.type === "private" && (command === "/app" || text === BTN_APP)) {
     return send(env, chatId, "Курсы, дедлайны и материалы в одном месте.", {
       reply_markup: { inline_keyboard: [[{ text: "Открыть мини-приложение", web_app: { url: `${origin}/app/` } }]] },
@@ -1063,7 +1068,7 @@ async function handleMessage(msg, catalog, env, origin) {
   if (msg.chat.type === "private" && command === "/submit_file") {
     return requestStudentFile(env, chatId);
   }
-  if (msg.chat.type === "private" && replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) === STUDENT_FILE_PROMPT) {
+  if (!command && msg.chat.type === "private" && replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) === STUDENT_FILE_PROMPT) {
     if (!msg.document?.file_id) return requestStudentFile(env, chatId);
     if (!catalog?.groups?.length) return send(env, chatId, "Группы пока недоступны. Попробуйте позже.");
     return send(env, chatId, STUDENT_GROUP_PROMPT, {
@@ -1091,7 +1096,7 @@ async function handleMessage(msg, catalog, env, origin) {
   if (msg.chat.type === "private" && (command === "/support" || text === BTN_SUPPORT)) {
     return supportPrompt(env, chatId);
   }
-  if (msg.chat.type === "private" && replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) === SUPPORT_PROMPT) {
+  if (command !== "/start" && msg.chat.type === "private" && replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) === SUPPORT_PROMPT) {
     return submitSupport(msg, catalog, env);
   }
 
@@ -1226,11 +1231,12 @@ async function handleCallback(cq, catalog, env) {
         await send(env, reviewOwner, "Администратор отклонил файл. Если хотите уточнить причину, напишите в поддержку.");
         return send(env, chatId, "Файл отклонён.");
       }
-      return send(env, chatId, "Отменено.");
+      return send(env, chatId, "Отменено.", sub ? { reply_markup: mainKeyboard() } : {});
     }
     if (studentSubmission) {
       if (await sendFileForReview(env, catalog, source, chatId, selected)) {
-        return send(env, chatId, "Файл передан администратору. Если он его одобрит, бот разошлёт документ выбранным группам.");
+        return send(env, chatId, "Файл передан администратору. Если он его одобрит, бот разошлёт документ выбранным группам.",
+          sub ? { reply_markup: mainKeyboard() } : {});
       }
       await edit(msg.reply_markup);
       return send(env, chatId, "Не удалось передать файл на проверку. Попробуйте ещё раз.");
