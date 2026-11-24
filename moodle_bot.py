@@ -61,7 +61,8 @@ RENAMED_GROUPS = {"my-group": "m104"}
 
 # Команды бота: ключи групп не должны с ними совпадать.
 RESERVED_COMMANDS = {"start", "stop", "courses", "deadlines", "search", "settings",
-                     "stats", "broadcast", "calendar", "id", "support", "support_setup", "refresh_keyboard", "app", "upload"}
+                     "stats", "broadcast", "calendar", "id", "support", "support_setup", "refresh_keyboard",
+                     "app", "upload", "submit_file"}
 BTN_COURSES = "📚 Мои курсы"
 BTN_DEADLINES = "⏰ Дедлайны"
 BTN_SETTINGS = "⚙️ Настройки"

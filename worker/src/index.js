@@ -34,6 +34,9 @@ const BTN_APP = "🎓 Мини-приложение";
 const BTN_SUPPORT = "💬 Связаться с поддержкой";
 const UPLOAD_ACCESS = "Запросить доступ для размещения своих файлов в бота";
 const UPLOAD_PROMPT = "Выберите группы, затем нажмите «Разослать файл».";
+const STUDENT_FILE_PROMPT = "Прикрепите документ ответом на это сообщение. Можно добавить подпись к файлу. После этого выберите группы для рассылки.";
+const STUDENT_GROUP_PROMPT = "Выберите группы, затем нажмите «На проверку». Файл увидит администратор.";
+const REVIEW_PROMPT = "Файл на модерации. Проверьте документ и группы перед рассылкой.";
 const SUPPORT_PROMPT = "Напишите в поддержку ответом на это сообщение. Здесь можно задать вопрос или попросить добавить именно вашу группу в бота.";
 const REMINDER_OPTIONS = [[259200, "за 3 дня"], [86400, "за сутки"], [10800, "за 3 часа"], [3600, "за 1 час"]];
 const DEFAULT_REMINDERS = [86400, 10800];
@@ -281,8 +284,12 @@ async function miniAppData(request, url, env) {
   if (!catalog) return respond({ error: "Каталог Moodle ещё загружается." }, 503);
   const body = request.method === "POST" ? await request.json().catch(() => null) : null;
   if (route === "support" && request.method === "POST") {
-    const message = body?.uploadAccess === true ? UPLOAD_ACCESS :
-      typeof body?.text === "string" ? body.text.trim() : "";
+    if (body?.uploadAccess === true) {
+      const prompt = await requestStudentFile(env, chatId);
+      return prompt.ok ? respond({ ok: true }) :
+        respond({ error: "Откройте чат Moodle-бота и отправьте /submit_file." }, 502);
+    }
+    const message = typeof body?.text === "string" ? body.text.trim() : "";
     if (!message || message.length > 3500) return respond({ error: "Введите сообщение до 3500 символов." }, 400);
     const ok = await forwardSupport(env, catalog, previous, chatId, Date.now(), message);
     return ok ? respond({ ok: true }) : respond({ error: "Не удалось отправить сообщение. Попробуйте позже." }, 502);
@@ -991,15 +998,33 @@ async function broadcastToSubscribers(env, catalog, chatId, group, body, options
   return send(env, chatId, `📣 Получателей ${targets.length} (${whom}) — разошлю при ближайшей проверке, в течение ${checkEvery(catalog)} минут.`);
 }
 
-function uploadKeyboard(catalog, selected = []) {
+function uploadKeyboard(catalog, selected = [], action = "Разослать файл", cancel = "Отмена") {
   const buttons = catalog.groups.map(({ key, title }) => ({
     text: `${selected.includes(key) ? "✅ " : "▫️ "}${title}`, callback_data: `upload_group:${key}`,
   }));
   const rows = [];
   for (let i = 0; i < buttons.length; i += 2) rows.push(buttons.slice(i, i + 2));
-  rows.push([{ text: "Разослать файл", callback_data: "upload_send" },
-    { text: "Отмена", callback_data: "upload_cancel" }]);
+  rows.push([{ text: action, callback_data: "upload_send" },
+    { text: cancel, callback_data: "upload_cancel" }]);
   return { inline_keyboard: rows };
+}
+
+function requestStudentFile(env, chatId) {
+  return send(env, chatId, STUDENT_FILE_PROMPT, { reply_markup: { force_reply: true } });
+}
+
+async function sendFileForReview(env, catalog, source, student, selected) {
+  const admin = String(catalog.admin || "").trim();
+  if (!admin) return false;
+  const document = await tg(env, "sendDocument", {
+    chat_id: admin, document: source.document.file_id, caption: source.caption || "",
+  });
+  if (!document.ok) return false;
+  const review = await send(env, admin, `${REVIEW_PROMPT}\nОтправитель: ${student}`, {
+    reply_parameters: { message_id: document.result.message_id },
+    reply_markup: uploadKeyboard(catalog, selected, "Одобрить и разослать", "Отклонить"),
+  });
+  return review.ok;
 }
 
 // ------------------------------ Обработка ------------------------------
@@ -1032,6 +1057,18 @@ async function handleMessage(msg, catalog, env, origin) {
   if (msg.chat.type === "private" && (command === "/app" || text === BTN_APP)) {
     return send(env, chatId, "Курсы, дедлайны и материалы в одном месте.", {
       reply_markup: { inline_keyboard: [[{ text: "Открыть мини-приложение", web_app: { url: `${origin}/app/` } }]] },
+    });
+  }
+
+  if (msg.chat.type === "private" && command === "/submit_file") {
+    return requestStudentFile(env, chatId);
+  }
+  if (msg.chat.type === "private" && replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) === STUDENT_FILE_PROMPT) {
+    if (!msg.document?.file_id) return requestStudentFile(env, chatId);
+    if (!catalog?.groups?.length) return send(env, chatId, "Группы пока недоступны. Попробуйте позже.");
+    return send(env, chatId, STUDENT_GROUP_PROMPT, {
+      reply_parameters: { message_id: msg.message_id },
+      reply_markup: uploadKeyboard(catalog, [], "На проверку"),
     });
   }
 
@@ -1152,16 +1189,19 @@ async function handleCallback(cq, catalog, env) {
   const sub = await getSub(env, chatId);
   if (data === "support_upload" && msg.chat.type === "private") {
     await answer();
-    const ok = await forwardSupport(env, catalog, sub, chatId, Date.now(), UPLOAD_ACCESS);
-    return send(env, chatId, ok ? "Запрос отправлен. Ответ придёт сюда." : "Не удалось отправить запрос. Попробуйте позже.");
+    return requestStudentFile(env, chatId);
   }
   if (data.startsWith("upload_")) {
-    if (msg.chat.type !== "private" || !isAdmin(catalog, chatId) || String(cq.from?.id) !== chatId) {
-      return answer("Размещение файлов доступно администратору.");
-    }
+    if (msg.chat.type !== "private" || String(cq.from?.id) !== chatId) return answer();
     const source = msg.reply_to_message;
-    if (msg.text !== UPLOAD_PROMPT || !source?.document?.file_id || String(source.from?.id) !== chatId) {
-      return answer("Пришлите файл заново.");
+    const studentSubmission = msg.text === STUDENT_GROUP_PROMPT;
+    const reviewOwner = msg.text?.startsWith(REVIEW_PROMPT + "\n")
+      ? msg.text.match(/\nОтправитель: (\d+)$/)?.[1] : null;
+    if (!studentSubmission && !isAdmin(catalog, chatId)) return answer("Одобрить файл может только администратор.");
+    const sourceId = reviewOwner ? env.TELEGRAM_BOT_TOKEN.split(":")[0] : chatId;
+    if ((!studentSubmission && !reviewOwner && msg.text !== UPLOAD_PROMPT) ||
+        !source?.document?.file_id || String(source.from?.id) !== sourceId) {
+      return answer("Файл недоступен. Пришлите его заново.");
     }
     const selected = (msg.reply_markup?.inline_keyboard || []).flat()
       .filter((button) => button.callback_data?.startsWith("upload_group:") && button.text.startsWith("✅ "))
@@ -1172,13 +1212,29 @@ async function handleCallback(cq, catalog, env) {
       const key = data.slice("upload_group:".length);
       if (!catalog.groups.some((group) => group.key === key)) return answer("Группа больше недоступна.");
       await answer();
-      return edit(uploadKeyboard(catalog, selected.includes(key) ? selected.filter((value) => value !== key) : [...selected, key]));
+      return edit(uploadKeyboard(catalog, selected.includes(key) ? selected.filter((value) => value !== key) : [...selected, key],
+        studentSubmission ? "На проверку" : reviewOwner ? "Одобрить и разослать" : "Разослать файл",
+        reviewOwner ? "Отклонить" : "Отмена"));
     }
     if (data === "upload_send" && !selected.length) return answer("Выберите хотя бы одну группу.");
     if (data !== "upload_send" && data !== "upload_cancel") return answer();
-    await answer(data === "upload_cancel" ? "Отменено" : "Рассылаю файл…");
+    await answer();
     const locked = await edit({ inline_keyboard: [] });
-    if (!locked.ok || data === "upload_cancel") return;
+    if (!locked.ok) return;
+    if (data === "upload_cancel") {
+      if (reviewOwner) {
+        await send(env, reviewOwner, "Администратор отклонил файл. Если хотите уточнить причину, напишите в поддержку.");
+        return send(env, chatId, "Файл отклонён.");
+      }
+      return send(env, chatId, "Отменено.");
+    }
+    if (studentSubmission) {
+      if (await sendFileForReview(env, catalog, source, chatId, selected)) {
+        return send(env, chatId, "Файл передан администратору. Если он его одобрит, бот разошлёт документ выбранным группам.");
+      }
+      await edit(msg.reply_markup);
+      return send(env, chatId, "Не удалось передать файл на проверку. Попробуйте ещё раз.");
+    }
     return broadcastToSubscribers(env, catalog, chatId, selected, source.caption || "", { document: source.document.file_id });
   }
   const replaceMessage = async (replacement) => {

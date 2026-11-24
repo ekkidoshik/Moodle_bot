@@ -119,10 +119,11 @@ function showSupport() {
   accessStatus.setAttribute("role", "status");
   const access = button("Запросить доступ для размещения своих файлов в бота", "row secondary", async () => {
     access.disabled = true;
-    accessStatus.textContent = "Отправляем запрос…";
+    accessStatus.textContent = "Открываем чат для загрузки файла…";
     try {
       await api("support", {}, { uploadAccess: true });
-      accessStatus.textContent = "Запрос отправлен. Ответ придёт в чат Moodle-бота.";
+      accessStatus.textContent = "Прикрепите файл ответом на сообщение в чате Moodle-бота.";
+      telegram.close();
     } catch (error) {
       access.disabled = false;
       accessStatus.textContent = error.message;
