@@ -3,6 +3,7 @@ const view = document.querySelector("#view");
 const tabs = document.querySelector("#tabs");
 const group = document.querySelector("#group");
 const settings = document.querySelector("#settings");
+const favorites = document.querySelector("#favorites");
 const dateFormat = new Intl.DateTimeFormat("ru-RU", { day: "numeric", month: "short", timeZone: "Europe/Moscow" });
 const timeFormat = new Intl.DateTimeFormat("ru-RU", { hour: "2-digit", minute: "2-digit", timeZone: "Europe/Moscow" });
 let overview;
@@ -30,6 +31,10 @@ function notice(message) {
   return element("p", "notice", message);
 }
 
+function emptyState(message, joke) {
+  return element("div", "notice", message, element("span", "meme", joke));
+}
+
 function section(title, content, action) {
   const header = element("div", "section-head", element("h2", "", title));
   if (action) header.append(action);
@@ -51,22 +56,22 @@ function externalRow(url, className, ...content) {
   return link;
 }
 
-async function api(path, params = {}, payload) {
+async function api(path, params = {}, payload, method = payload ? "POST" : "GET") {
   const query = new URLSearchParams(params);
   const response = await fetch(`/mini-api/${path}?${query}`, {
-    method: payload ? "POST" : "GET",
+    method,
     headers: { Authorization: `tma ${telegram.initData}`,
       ...(payload ? { "Content-Type": "application/json" } : {}) },
     body: payload ? JSON.stringify(payload) : undefined,
     cache: "no-store",
   });
-  const data = await response.json();
+  const data = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(data.error || "Не удалось загрузить данные.");
   return data;
 }
 
 function deadlineList(deadlines) {
-  if (!deadlines.length) return notice("Ближайших дедлайнов нет.");
+  if (!deadlines.length) return emptyState("Ближайших дедлайнов нет.", "Moodle: сегодня без сюрпризов.");
   return element("div", "list", ...deadlines.map((deadline) => {
     const date = new Date(deadline.due * 1000);
     const course = overview.courses.find((item) => item.id === deadline.course);
@@ -96,6 +101,81 @@ function applyOverview(data) {
   group.hidden = !data.group;
   tabs.hidden = !data.group;
   settings.hidden = false;
+  favorites.hidden = false;
+}
+
+function showSupport() {
+  const input = element("textarea", "group-select");
+  input.id = "support-message";
+  input.rows = 5;
+  input.maxLength = 3500;
+  input.required = true;
+  const submit = element("button", "primary more", "Отправить");
+  submit.type = "submit";
+  const status = element("p", "settings-status");
+  status.setAttribute("role", "status");
+  const form = element("form", "settings-card", element("label", "group-label", "Сообщение", input), submit, status);
+  form.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const text = input.value.trim();
+    if (!text || submit.disabled) return;
+    input.disabled = submit.disabled = true;
+    status.textContent = "Отправляем…";
+    try {
+      await api("support", {}, { text });
+      input.value = "";
+      status.textContent = "Сообщение отправлено. Ответ придёт в чат Moodle-бота.";
+    } catch (error) {
+      status.textContent = error.message;
+    } finally {
+      input.disabled = submit.disabled = false;
+    }
+  });
+  view.replaceChildren(heading("Поддержка"),
+    element("p", "settings-intro", "Здесь можно задать вопрос или попросить добавить свою группу в бота."), form);
+}
+
+function itemRow(item, meta, action) {
+  return element("div", "item-row",
+    externalRow(item.url, "row", element("strong", "", item.name), element("span", "meta", meta)), action);
+}
+
+async function showFavorites(container, version, cursor) {
+  try {
+    const data = await api("favorites", cursor ? { cursor } : {});
+    if (navigation !== version) return;
+    if (!cursor) container.replaceChildren();
+    for (const item of data.items) {
+      const remove = button("×", "item-action", async () => {
+        remove.disabled = true;
+        try {
+          await api("favorites", { id: item.id }, undefined, "DELETE");
+          row.remove();
+          if (!container.children.length) container.append(notice("Избранное пока пусто."));
+        } catch (error) {
+          remove.disabled = false;
+          remove.title = error.message;
+          container.append(notice(error.message));
+        }
+      });
+      remove.setAttribute("aria-label", `Убрать из избранного: ${item.name}`);
+      const row = itemRow(item, [item.course, ...item.files].filter(Boolean).join(" · "), remove);
+      container.append(row);
+    }
+    if (data.cursor) {
+      const next = button("Показать ещё", "primary more", () => {
+        next.remove();
+        showFavorites(container, version, data.cursor);
+      });
+      container.append(next);
+    } else if (!container.children.length) {
+      container.append(notice("Избранное пока пусто. Сохраняйте материалы кнопкой ☆."));
+    }
+  } catch (error) {
+    if (navigation !== version) return;
+    if (!cursor) container.replaceChildren();
+    container.append(notice(error.message));
+  }
 }
 
 function showSettings() {
@@ -140,7 +220,7 @@ function showSettings() {
   });
   view.replaceChildren(heading(overview.group ? "Настройки" : "Выберите группу"),
     element("p", "settings-intro", "Курсы, дедлайны и уведомления бота будут относиться к выбранной группе."),
-    form);
+    form, button("Связаться с поддержкой", "row secondary", () => switchTab("support")));
 }
 
 function switchTab(tab) {
@@ -152,12 +232,21 @@ function switchTab(tab) {
   telegram?.BackButton?.hide();
   window.scrollTo(0, 0);
 
-  if (tab === "settings") {
+  if (tab === "support" || tab === "favorites") {
+    telegram?.BackButton?.show();
+    if (tab === "support") {
+      showSupport();
+    } else {
+      const list = element("div", "list", notice("Загружаем избранное…"));
+      view.replaceChildren(heading("Избранное"), list);
+      showFavorites(list, navigation);
+    }
+  } else if (tab === "settings") {
     if (overview.group) telegram?.BackButton?.show();
     showSettings();
   } else if (tab === "home") {
     view.replaceChildren(
-      element("section", "hero", element("p", "eyebrow", "МОЙ MOODLE"),
+      element("section", "hero",
         heading(overview.firstName ? `Привет, ${overview.firstName}!` : "Учёба под рукой"),
         element("p", "", "Курсы и дедлайны вашей группы")),
       element("div", "summary", stat(overview.courses.length, "Курсы", "courses"),
@@ -165,7 +254,8 @@ function switchTab(tab) {
       section("Ближайшие дедлайны", deadlineList(overview.deadlines.slice(0, 3)),
         button("Все дедлайны", "link-button", () => switchTab("deadlines"))),
       section("Мои курсы", courseList(overview.courses.slice(0, 3)),
-        button("Все курсы", "link-button", () => switchTab("courses"))));
+        button("Все курсы", "link-button", () => switchTab("courses"))),
+      button("Связаться с поддержкой", "link-button support-link", () => switchTab("support")));
   } else if (tab === "courses") {
     view.replaceChildren(heading("Мои курсы"), courseList(overview.courses));
   } else if (tab === "deadlines") {
@@ -205,11 +295,28 @@ async function showMaterials(container, params, version, page = 0) {
     const { items, more } = await api("materials", { ...params, page });
     if (version !== navigation) return;
     if (!page) container.replaceChildren();
-    if (!items.length && !page) container.append(notice("Материалы не найдены."));
+    if (!items.length && !page) container.append(params.q
+      ? emptyState("Материалы не найдены.", "Где-то лежит «финал_точно_финал.pdf».")
+      : notice("В этом курсе пока нет материалов."));
     if (items.length) {
-      container.append(element("div", "list", ...items.map((item) =>
-        externalRow(item.url, "row", element("strong", "", item.name),
-          element("span", "meta", [params.q ? item.course : "", ...item.files].filter(Boolean).join(" · "))))));
+      container.append(element("div", "list", ...items.map((item) => {
+        const meta = [params.q ? item.course : "", ...item.files].filter(Boolean).join(" · ");
+        if (!/^https:\/\//i.test(item.url || "")) return externalRow(item.url, "row",
+          element("strong", "", item.name), element("span", "meta", meta));
+        const save = button("☆", "item-action", async () => {
+          save.disabled = true;
+          try {
+            await api("favorites", {}, { id: item.id });
+            save.textContent = "★";
+            save.setAttribute("aria-label", "В избранном");
+          } catch (error) {
+            save.disabled = false;
+            container.append(notice(error.message));
+          }
+        });
+        save.setAttribute("aria-label", `В избранное: ${item.name}`);
+        return itemRow(item, meta, save);
+      })));
     }
     if (more) {
       const next = button("Показать ещё", "primary more", async () => {
@@ -251,9 +358,10 @@ tabs.addEventListener("click", (event) => {
   if (tab) switchTab(tab);
 });
 settings.addEventListener("click", () => switchTab("settings"));
+favorites.addEventListener("click", () => switchTab("favorites"));
 telegram?.BackButton?.onClick(() => {
-  if (!overview?.group || settings.disabled) return;
-  switchTab(tabs.querySelector('[aria-current="page"]') ? "courses" : "home");
+  if (!overview || settings.disabled) return;
+  switchTab(!overview.group ? "settings" : tabs.querySelector('[aria-current="page"]') ? "courses" : "home");
 });
 
 start();

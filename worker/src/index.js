@@ -52,7 +52,8 @@ export default {
     ORIGIN = url.origin;
 
     if ((request.method === "GET" && url.pathname.startsWith("/mini-api/")) ||
-        (request.method === "POST" && url.pathname === "/mini-api/group")) {
+        (request.method === "POST" && ["/mini-api/group", "/mini-api/support", "/mini-api/favorites"].includes(url.pathname)) ||
+        (request.method === "DELETE" && url.pathname === "/mini-api/favorites")) {
       return miniAppData(request, url, env);
     }
 
@@ -256,12 +257,41 @@ async function miniAppData(request, url, env) {
   const user = await telegramMiniUser(request.headers.get("Authorization"), env.TELEGRAM_BOT_TOKEN);
   if (!user) return respond({ error: "Откройте мини-приложение заново из Telegram." }, 401);
   const chatId = String(user.id);
+  const route = url.pathname.slice("/mini-api/".length);
+  if (route === "favorites" && request.method !== "POST") {
+    const prefix = `saved:${chatId}:`;
+    if (request.method === "DELETE") {
+      const id = url.searchParams.get("id");
+      if (!/^(?:m|assign|quiz):\d+$/.test(id || "")) return respond({ error: "Материал не найден." }, 400);
+      await env.BOT_KV.delete(prefix + id);
+      return respond({ ok: true });
+    }
+    const cursor = url.searchParams.get("cursor") || undefined;
+    const page = await env.BOT_KV.list({ prefix, cursor, limit: 24 });
+    const items = await Promise.all(page.keys.map(async ({ name, metadata }) => {
+      const item = metadata || await env.BOT_KV.get(name, "json");
+      return item && { id: name.slice(prefix.length), name: item.n, url: item.u,
+        course: item.course, files: item.files || [] };
+    }));
+    return respond({ items: items.filter(Boolean), cursor: page.list_complete ? null : page.cursor });
+  }
   const [catalog, previous] = await Promise.all([getCatalog(env), getSub(env, chatId)]);
   if (!catalog) return respond({ error: "Каталог Moodle ещё загружается." }, 503);
-  const route = url.pathname.slice("/mini-api/".length);
+  const body = request.method === "POST" ? await request.json().catch(() => null) : null;
+  if (route === "support" && request.method === "POST") {
+    const message = typeof body?.text === "string" ? body.text.trim() : "";
+    if (!message || message.length > 3500) return respond({ error: "Введите сообщение до 3500 символов." }, 400);
+    const ok = await forwardSupport(env, catalog, previous, chatId, Date.now(), message);
+    return ok ? respond({ ok: true }) : respond({ error: "Не удалось отправить сообщение. Попробуйте позже." }, 502);
+  }
+  if (route === "favorites" && request.method === "POST") {
+    if (!catalog.groups.some((g) => g.key === previous?.g)) return respond({ error: "Сначала выберите группу." }, 403);
+    if (typeof body?.id !== "string" || !/^m:\d+$/.test(body.id)) return respond({ error: "Материал не найден." }, 400);
+    return await saveItem(env, catalog, chatId, previous.g, body.id)
+      ? respond({ ok: true }) : respond({ error: "Материал недоступен." }, 404);
+  }
   let sub = previous;
   if (request.method === "POST") {
-    const body = await request.json().catch(() => null);
     if (!catalog.groups.some((g) => g.key === body?.group)) {
       return respond({ error: "Выберите группу из списка." }, 400);
     }
@@ -299,7 +329,8 @@ async function miniAppData(request, url, env) {
   const page = Math.max(0, Math.min(1000, parseInt(url.searchParams.get("page"), 10) || 0));
   const offset = page * 24;
   return respond({
-    items: items.slice(offset, offset + 24).map((m) => ({ name: m.n, url: m.u, course: names[m.c], files: (m.f || []).slice(0, 3) })),
+    items: items.slice(offset, offset + 24).map((m) => ({ id: `m:${m.id}`, name: m.n, url: m.u,
+      course: names[m.c], files: (m.f || []).slice(0, 3) })),
     more: items.length > offset + 24,
   });
 }
@@ -612,6 +643,7 @@ async function saveItem(env, catalog, chatId, key, id) {
   const storageKey = `saved:${chatId}:${id}`;
   if (await env.BOT_KV.get(storageKey)) return true;
   const metadata = { n: item.n.slice(0, 150), u: item.u, course: names[item.c].slice(0, 100) };
+  if (item.f?.length) metadata.files = item.f.slice(0, 3).map((file) => file.slice(0, 120));
   const value = JSON.stringify(metadata);
   const options = new TextEncoder().encode(value).length <= 1024 ? { metadata } : {};
   await env.BOT_KV.put(storageKey, value, options);
@@ -796,12 +828,17 @@ async function submitSupport(msg, catalog, env) {
     await send(env, chatId, "Поддержка принимает текст до 3500 символов.");
     return supportPrompt(env, chatId);
   }
-  const admin = String(catalog?.admin || "").trim();
-  if (!admin) return send(env, chatId, "Поддержка пока недоступна. Попробуйте позже.");
-
   const sub = await getSub(env, chatId);
+  const ok = await forwardSupport(env, catalog, sub, chatId, msg.message_id, text);
+  return send(env, chatId, ok ? "Сообщение отправлено в поддержку." :
+    "Не удалось отправить сообщение в поддержку. Попробуйте позже.");
+}
+
+async function forwardSupport(env, catalog, sub, chatId, messageId, text) {
+  const admin = String(catalog?.admin || "").trim();
+  if (!admin) return false;
   const group = sub ? groupTitle(catalog, sub.g).slice(0, 150) : "группа не выбрана";
-  const reference = `${chatId}:${msg.message_id}`;
+  const reference = `${chatId}:${messageId}`;
   const signature = await supportSignature(env, reference);
   const body = {
     chat_id: admin,
@@ -810,8 +847,7 @@ async function submitSupport(msg, catalog, env) {
   };
   let delivered = env.SUPPORT_BOT_TOKEN && await tg(env, "sendMessage", body, env.SUPPORT_BOT_TOKEN);
   if (!delivered?.ok) delivered = await tg(env, "sendMessage", body);
-  return send(env, chatId, delivered.ok ? "Сообщение отправлено в поддержку." :
-    "Не удалось отправить сообщение в поддержку. Попробуйте позже.");
+  return delivered.ok;
 }
 
 async function handleSupportReply(msg, env, token) {
