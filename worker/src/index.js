@@ -52,7 +52,7 @@ export default {
     ORIGIN = url.origin;
 
     if ((request.method === "GET" && url.pathname.startsWith("/mini-api/")) ||
-        (request.method === "POST" && ["/mini-api/group", "/mini-api/support", "/mini-api/favorites"].includes(url.pathname)) ||
+        (request.method === "POST" && ["/mini-api/group", "/mini-api/support", "/mini-api/favorites", "/mini-api/file"].includes(url.pathname)) ||
         (request.method === "DELETE" && url.pathname === "/mini-api/favorites")) {
       return miniAppData(request, url, env);
     }
@@ -290,6 +290,19 @@ async function miniAppData(request, url, env) {
     return await saveItem(env, catalog, chatId, previous.g, body.id)
       ? respond({ ok: true }) : respond({ error: "Материал недоступен." }, 404);
   }
+  if (route === "file" && request.method === "POST") {
+    const group = catalog.groups.find((g) => g.key === previous?.g);
+    if (!group) return respond({ error: "Сначала выберите группу." }, 403);
+    if (typeof body?.id !== "string" || !/^m:\d+$/.test(body.id) || typeof body.path !== "string") {
+      return respond({ error: "Файл не найден." }, 400);
+    }
+    const index = (await env.BOT_KV.get(`index:${group.key}`, "json")) || [];
+    const material = index.find((m) => m.id === body.id.slice(2) &&
+      Object.hasOwn(catalog.course_names[group.key] || {}, m.c) && m.f?.includes(body.path));
+    if (!material) return respond({ error: "Файл недоступен. Обновите список материалов." }, 404);
+    return await queueFile(env, chatId, group.key, material, body.path)
+      ? respond({ ok: true }) : respond({ error: "Не удалось запросить файл. Попробуйте позже." }, 503);
+  }
   let sub = previous;
   if (request.method === "POST") {
     if (!catalog.groups.some((g) => g.key === body?.group)) {
@@ -330,7 +343,7 @@ async function miniAppData(request, url, env) {
   const offset = page * 24;
   return respond({
     items: items.slice(offset, offset + 24).map((m) => ({ id: `m:${m.id}`, name: m.n, url: m.u,
-      course: names[m.c], files: (m.f || []).slice(0, 3) })),
+      course: names[m.c], files: m.f || [] })),
     more: items.length > offset + 24,
   });
 }
@@ -775,10 +788,10 @@ function norm(s) {
   return String(s).toLowerCase().replace(/ё/g, "е");
 }
 
-async function searchText(env, catalog, key, query) {
+async function sendSearch(env, chatId, catalog, key, query) {
   const words = norm(query).split(/\s+/).filter(Boolean);
   if (!words.length) {
-    return "🔎 Напишите, что найти, например: <code>/search лекция 5</code> — или просто отправьте слово сообщением.";
+    return send(env, chatId, "🔎 Напишите, что найти, например: <code>/search лекция 5</code> — или просто отправьте слово сообщением.");
   }
   const index = (await env.BOT_KV.get(`index:${key}`, "json")) || [];
   const names = catalog.course_names[key] || {};
@@ -786,16 +799,36 @@ async function searchText(env, catalog, key, query) {
     const hay = norm(`${m.n} ${(m.f || []).join(" ")} ${names[m.c] || ""}`);
     return words.every((w) => hay.includes(w));
   });
-  if (!found.length) return `🔎 По запросу «${esc(query.trim())}» ничего не нашлось.`;
-  const lines = found.slice(0, SEARCH_LIMIT).map((m) => {
-    const title = m.u ? `<a href="${esc(m.u)}">${esc(m.n)}</a>` : esc(m.n);
+  if (!found.length) return send(env, chatId, `🔎 По запросу «${esc(query.trim().slice(0, 120))}» ничего не нашлось.`);
+  const results = found.slice(0, SEARCH_LIMIT);
+  const rows = [];
+  const lines = results.map((m, i) => {
+    const title = courseMaterialLine(m);
     const files = (m.f || []).filter((f) => words.some((w) => norm(f).includes(w)));
-    const shown = (files.length ? files : m.f || []).slice(0, 3);
-    return `• ${title}\n   ${esc(names[m.c] || `Курс ${m.c}`)}` +
-      (shown.length ? `\n   📎 ${shown.map(esc).join(", ")}` : "");
+    const shown = (files.length ? files : m.f || []).slice(0, 1);
+    if (shown.length) rows.push([{
+      text: `📎 ${i + 1}. ${(m.f.length === 1 ? shown[0].split("/").pop() : m.n).slice(0, 42)}`,
+      callback_data: `files:${m.c}:${m.id}:0`,
+    }]);
+    return `${i + 1}. ${title}\n   ${esc((names[m.c] || `Курс ${m.c}`).slice(0, 72))}` +
+      (shown.length ? `\n   📎 ${esc(shown[0].slice(0, 64))}` : "");
   });
   const more = found.length > SEARCH_LIMIT ? `\n\nПоказаны первые ${SEARCH_LIMIT} из ${found.length} — уточните запрос.` : "";
-  return `🔎 Нашлось ${found.length}:\n\n` + lines.join("\n\n") + more;
+  const hint = rows.length ? "\n\nНажмите 📎, чтобы получить файл в Telegram." : "";
+  return send(env, chatId, `🔎 Нашлось ${found.length}:\n\n` + lines.join("\n\n") + more + hint,
+    rows.length ? { reply_markup: { inline_keyboard: rows } } : {});
+}
+
+async function queueFile(env, chatId, group, material, path) {
+  try {
+    await env.BOT_KV.put(`file-request:${crypto.randomUUID()}`, JSON.stringify({
+      chat: chatId, group, cid: material.c, mid: material.id, path,
+    }), { expirationTtl: 3600 });
+    return true;
+  } catch (e) {
+    console.log("Не удалось записать запрос на файл:", e.message);
+    return false;
+  }
 }
 
 function isAdmin(catalog, chatId) {
@@ -1025,7 +1058,7 @@ async function handleMessage(msg, catalog, env, origin) {
   }
   if (command === "/search") {
     if (!current) return send(env, chatId, "Сначала выберите группу: /start");
-    return send(env, chatId, await searchText(env, catalog, current, text.replace(/^\/search(@\S+)?/i, "")));
+    return sendSearch(env, chatId, catalog, current, text.replace(/^\/search(@\S+)?/i, ""));
   }
   if (command === "/calendar") {
     if (!current) return send(env, chatId, "Сначала выберите группу: /start");
@@ -1062,7 +1095,7 @@ async function handleMessage(msg, catalog, env, origin) {
   }
   // любой другой текст от подписчика — поиск по материалам
   if (current && text && !text.startsWith("/") && msg.chat.type === "private") {
-    return send(env, chatId, await searchText(env, catalog, current, text));
+    return sendSearch(env, chatId, catalog, current, text);
   }
   if (msg.chat.type === "private") {
     return send(env, chatId, current ? "Откройте меню бота." : "Сначала выберите группу через /start.",
@@ -1101,13 +1134,7 @@ async function handleCallback(cq, catalog, env) {
     const offset = Number(position);
     if (offset >= files.length) return answer("Файл недоступен. Откройте список материалов заново.");
     if (action === "file" || files.length === 1) {
-      const id = crypto.randomUUID();
-      try {
-        await env.BOT_KV.put(`file-request:${id}`, JSON.stringify({
-          chat: chatId, group, cid, mid, path: files[offset],
-        }), { expirationTtl: 3600 });
-      } catch (e) {
-        console.log("Не удалось записать запрос на файл:", e.message);
+      if (!await queueFile(env, chatId, group, material, files[offset])) {
         return answer("Не удалось запросить файл. Попробуйте позже.");
       }
       await answer();

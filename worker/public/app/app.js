@@ -140,6 +140,28 @@ function itemRow(item, meta, action) {
     externalRow(item.url, "row", element("strong", "", item.name), element("span", "meta", meta)), action);
 }
 
+function fileActions(item) {
+  const files = item.files.map((path) => {
+    const label = item.files.length === 1 ? "Получить файл в Telegram" : path;
+    const action = button(label, "file-action", async () => {
+      action.disabled = true;
+      try {
+        await api("file", {}, { id: item.id, path });
+        status.textContent = "Файл придёт в чат бота. Обычно это занимает до 5 минут.";
+        action.textContent = "Запрошено";
+      } catch (error) {
+        action.disabled = false;
+        status.textContent = error.message;
+      }
+    });
+    const status = element("p", "file-status");
+    status.setAttribute("role", "status");
+    return element("div", "file-option", action, status);
+  });
+  if (files.length === 1) return files[0];
+  return element("details", "file-options", element("summary", "", "Получить файл в Telegram"), ...files);
+}
+
 async function showFavorites(container, version, cursor) {
   try {
     const data = await api("favorites", cursor ? { cursor } : {});
@@ -301,8 +323,11 @@ async function showMaterials(container, params, version, page = 0) {
     if (items.length) {
       container.append(element("div", "list", ...items.map((item) => {
         const meta = [params.q ? item.course : "", ...item.files].filter(Boolean).join(" · ");
-        if (!/^https:\/\//i.test(item.url || "")) return externalRow(item.url, "row",
-          element("strong", "", item.name), element("span", "meta", meta));
+        if (!/^https:\/\//i.test(item.url || "")) {
+          return element("article", "material-result", externalRow(item.url, "row",
+            element("strong", "", item.name), element("span", "meta", meta)),
+          ...(item.files.length ? [fileActions(item)] : []));
+        }
         const save = button("☆", "item-action", async () => {
           save.disabled = true;
           try {
@@ -315,7 +340,8 @@ async function showMaterials(container, params, version, page = 0) {
           }
         });
         save.setAttribute("aria-label", `В избранное: ${item.name}`);
-        return itemRow(item, meta, save);
+        return element("article", "material-result", itemRow(item, meta, save),
+          ...(item.files.length ? [fileActions(item)] : []));
       })));
     }
     if (more) {
