@@ -233,7 +233,7 @@ class FileFetcher:
     def info(self, mid, key):
         return self.meta.get(mid, {}).get(key)
 
-    def get(self, mid, key):
+    def get(self, mid, key, *, raise_on_network_error=False):
         if (mid, key) in self.cache:
             return self.cache[(mid, key)]
         info, content = self.info(mid, key), None
@@ -241,12 +241,27 @@ class FileFetcher:
             try:
                 r = requests.get(info["url"], params={"token": self.token}, timeout=120)
                 r.raise_for_status()
-                if "application/json" in r.headers.get("content-type", ""):
-                    log.warning("Moodle не отдал файл %s: %s", key, r.text[:200])
+                # JSON сам может быть вложением. Moodle возвращает ошибку API
+                # отдельным JSON-объектом без заголовка attachment.
+                error = None
+                if ("application/json" in r.headers.get("content-type", "").lower()
+                        and "attachment" not in r.headers.get("content-disposition", "").lower()):
+                    try:
+                        result = r.json()
+                        if isinstance(result, dict) and (
+                            "exception" in result or ("errorcode" in result and "message" in result)
+                        ):
+                            error = result.get("errorcode") or "ошибка API"
+                    except ValueError:
+                        pass
+                if error:
+                    log.warning("Moodle не отдал файл %s: %s", key, error)
                 elif len(r.content) <= MAX_FILE_BYTES:
                     content = r.content
             except requests.RequestException as e:
-                log.warning("Не удалось скачать %s: %s", key, e)
+                if raise_on_network_error:
+                    raise
+                log.warning("Не удалось скачать %s: %s", key, type(e).__name__)
         self.cache[(mid, key)] = content
         return content
 
@@ -784,11 +799,22 @@ def process_file_requests(groups, state):
         raise
 
     fetchers = {}
+    progress = state.setdefault("file_request_progress", {})
+    now = int(time.time())
+    for request_id, attempt in list(progress.items()):
+        if now - attempt["ts"] > 3600:
+            del progress[request_id]
     stop_after = time.monotonic() + 75  # оставляем время на обычную проверку Moodle
     for entry in requests_to_send:
         if time.monotonic() >= stop_after:
             break
         job = entry["job"]
+        request_id = entry["id"]
+        attempt = progress.get(request_id, {"failures": 0})
+        if attempt.get("finished"):
+            relay("DELETE", f"/api/file-requests/{request_id}")
+            progress.pop(request_id)
+            continue
         chat_id, group, cid = job["chat"], job["group"], job["cid"]
         config = groups.get(group)
         if (config and state["subscribers"].get(chat_id) == group
@@ -797,12 +823,26 @@ def process_file_requests(groups, state):
             try:
                 send_requested_file(chat_id, config, job, fetchers)
             except (MoodleError, TelegramError, requests.RequestException, ValueError, KeyError) as e:
-                log.warning("Не удалось обработать запрос на файл для %s: %s", mask(chat_id), e)
-                try:
-                    send_message(chat_id, "Не удалось отправить файл. Попробуйте запросить его ещё раз.")
-                except (TelegramError, requests.RequestException) as notify_error:
-                    log.warning("Не удалось сообщить об ошибке запроса файла: %s", notify_error)
-        relay("DELETE", f"/api/file-requests/{entry['id']}")
+                failures = attempt["failures"] + 1
+                status = (e.status if isinstance(e, TelegramError) else
+                          e.response.status_code if isinstance(e, requests.HTTPError) and e.response is not None else None)
+                temporary = status in (408, 429) or (status is not None and 500 <= status <= 599)
+                temporary = temporary or (status is None and isinstance(e, (requests.Timeout, requests.ConnectionError)))
+                log.warning("Запрос файла для %s: попытка %d, %s%s", mask(chat_id), failures,
+                            type(e).__name__, f" HTTP {status}" if status else "")
+                if temporary and failures < 3:
+                    progress[request_id] = {"failures": failures, "ts": now}
+                    continue
+                if not (isinstance(e, TelegramError) and chat_is_gone(e)):
+                    try:
+                        message = ("Не удалось отправить файл после нескольких попыток. Попробуйте позже."
+                                   if temporary else "Файл недоступен для отправки. Проверьте, открывается ли он в Moodle.")
+                        send_message(chat_id, message)
+                    except (TelegramError, requests.RequestException) as notify_error:
+                        log.warning("Не удалось сообщить об ошибке запроса файла: %s", type(notify_error).__name__)
+        progress[request_id] = {"finished": True, "ts": now}
+        relay("DELETE", f"/api/file-requests/{request_id}")
+        progress.pop(request_id)
 
 
 def send_requested_file(chat_id, config, job, fetchers):
@@ -820,7 +860,7 @@ def send_requested_file(chat_id, config, job, fetchers):
     if info and info["size"] > MAX_FILE_BYTES:
         send_message(chat_id, "Файл слишком большой для отправки ботом. Откройте его в Moodle.")
         return
-    content = fetcher.get(mid, key)
+    content = fetcher.get(mid, key, raise_on_network_error=True)
     if content is None:
         raise MoodleError("файл недоступен")
     tg("sendDocument", files={"document": (path.rsplit("/", 1)[-1], content)}, chat_id=chat_id)
