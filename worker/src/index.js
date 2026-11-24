@@ -35,7 +35,9 @@ const BTN_SUPPORT = "💬 Поддержка";
 const OLD_BTN_SUPPORT = "💬 Связаться с поддержкой";
 const UPLOAD_PROMPT = "Выберите группы, затем нажмите «Разослать файл».";
 const LEGACY_STUDENT_FILE_PROMPT = "Прикрепите документ ответом на это сообщение. Можно добавить подпись к файлу. После этого выберите группы для рассылки.";
-const STUDENT_FILE_PROMPT = "Прикрепите файл через скрепку и выберите «Файл». Можно добавить подпись. После отправки бот предложит выбрать группы.";
+const PREVIOUS_STUDENT_FILE_PROMPT = "Прикрепите файл через скрепку и выберите «Файл». Можно добавить подпись. После отправки бот предложит выбрать группы.";
+const FILE_PICKER_INSTRUCTIONS = "Нажмите скрепку → «Файл» → «Файлы» (или «Обзор») и выберите документ в приложении «Файлы». Не выбирайте его в разделе «Недавние» Telegram.";
+const STUDENT_FILE_PROMPT = `${FILE_PICKER_INSTRUCTIONS}\n\nМожно добавить подпись. После отправки бот предложит выбрать группы.`;
 const STUDENT_GROUP_PROMPT = "Выберите группы, затем нажмите «На проверку». Файл увидит администратор.";
 const REVIEW_PROMPT = "Файл на модерации. Проверьте документ и группы перед рассылкой.";
 const SUPPORT_PROMPT = "Напишите в поддержку ответом на это сообщение. Здесь можно задать вопрос или попросить добавить именно вашу группу в бота.";
@@ -1077,7 +1079,7 @@ async function handleMessage(msg, catalog, env, origin) {
   }
   const admin = msg.chat.type === "private" && catalog && isAdmin(catalog, chatId);
   const prompt = msg.chat.type === "private" ? replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) : null;
-  const studentFileReply = prompt === STUDENT_FILE_PROMPT || prompt === LEGACY_STUDENT_FILE_PROMPT;
+  const studentFileReply = [STUDENT_FILE_PROMPT, PREVIOUS_STUDENT_FILE_PROMPT, LEGACY_STUDENT_FILE_PROMPT].includes(prompt);
   if (msg.chat.type === "private" && msg.document?.file_id && (!admin || studentFileReply)) {
     if (!catalog?.groups?.length) return send(env, chatId, "Группы пока недоступны. Попробуйте позже.");
     return send(env, chatId, STUDENT_GROUP_PROMPT, {
@@ -1086,7 +1088,7 @@ async function handleMessage(msg, catalog, env, origin) {
     });
   }
   if (!command && (studentFileReply || (msg.chat.type === "private" && msg.photo?.length))) {
-    return send(env, chatId, "Пришлите вложение как документ: скрепка → «Файл».");
+    return send(env, chatId, FILE_PICKER_INSTRUCTIONS);
   }
 
   if (admin) {
