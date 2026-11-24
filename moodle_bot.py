@@ -430,7 +430,7 @@ def setup_bot_profile(groups, state):
     if relay_enabled():
         commands[-1:-1] = [
             {"command": "saved", "description": "Избранное"},
-            {"command": "support", "description": "Связаться с поддержкой"},
+            {"command": "support", "description": "Поддержка"},
             {"command": "app", "description": "Открыть мини-приложение"},
         ]
     description = (
@@ -856,7 +856,7 @@ def refresh_subscriber_keyboards(state):
             refresh["unavailable"] += 1
         else:
             try:
-                send_message(chat_id, "Меню бота обновилось. Теперь в нём есть кнопка «Связаться с поддержкой».",
+                send_message(chat_id, "Меню бота обновилось. Теперь в нём есть кнопка «Поддержка».",
                              reply_markup=keyboard, disable_notification=True)
                 refresh["sent"] += 1
             except TelegramError as e:

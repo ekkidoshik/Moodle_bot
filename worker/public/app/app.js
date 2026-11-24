@@ -105,6 +105,25 @@ function applyOverview(data) {
 }
 
 function showSupport() {
+  const status = element("p", "settings-status");
+  status.setAttribute("role", "status");
+  const propose = button("Предложить файл для публикации", "row", async () => {
+    propose.disabled = true;
+    status.textContent = "Открываем чат для загрузки файла…";
+    try {
+      await api("support", {}, { uploadAccess: true });
+      status.textContent = "Прикрепите файл ответом на сообщение в чате Moodle-бота.";
+      telegram.close();
+    } catch (error) {
+      propose.disabled = false;
+      status.textContent = error.message;
+    }
+  });
+  view.replaceChildren(heading("Поддержка"), element("div", "list",
+    button("Написать в поддержку", "row", () => switchTab("support-write")), propose), status);
+}
+
+function showSupportForm() {
   const input = element("textarea", "group-select");
   input.id = "support-message";
   input.rows = 5;
@@ -115,20 +134,6 @@ function showSupport() {
   const status = element("p", "settings-status");
   status.setAttribute("role", "status");
   const form = element("form", "settings-card", element("label", "group-label", "Сообщение", input), submit, status);
-  const accessStatus = element("p", "settings-status");
-  accessStatus.setAttribute("role", "status");
-  const access = button("Запросить доступ для размещения своих файлов в бота", "row secondary", async () => {
-    access.disabled = true;
-    accessStatus.textContent = "Открываем чат для загрузки файла…";
-    try {
-      await api("support", {}, { uploadAccess: true });
-      accessStatus.textContent = "Прикрепите файл ответом на сообщение в чате Moodle-бота.";
-      telegram.close();
-    } catch (error) {
-      access.disabled = false;
-      accessStatus.textContent = error.message;
-    }
-  });
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
     const text = input.value.trim();
@@ -145,9 +150,9 @@ function showSupport() {
       input.disabled = submit.disabled = false;
     }
   });
-  view.replaceChildren(heading("Поддержка"),
+  view.replaceChildren(button("К поддержке", "back", () => switchTab("support")), heading("Написать в поддержку"),
     element("p", "settings-intro", "Здесь можно задать вопрос или попросить добавить свою группу в бота."),
-    form, access, accessStatus);
+    form);
 }
 
 function itemRow(item, meta, action) {
@@ -257,7 +262,7 @@ function showSettings() {
   });
   view.replaceChildren(heading(overview.group ? "Настройки" : "Выберите группу"),
     element("p", "settings-intro", "Курсы, дедлайны и уведомления бота будут относиться к выбранной группе."),
-    form, button("Связаться с поддержкой", "row secondary", () => switchTab("support")));
+    form, button("Поддержка", "row secondary", () => switchTab("support")));
 }
 
 function switchTab(tab) {
@@ -278,6 +283,8 @@ function switchTab(tab) {
       view.replaceChildren(heading("Избранное"), list);
       showFavorites(list, navigation);
     }
+  } else if (tab === "support-write") {
+    showSupportForm();
   } else if (tab === "settings") {
     if (overview.group) telegram?.BackButton?.show();
     showSettings();
@@ -292,7 +299,7 @@ function switchTab(tab) {
         button("Все дедлайны", "link-button", () => switchTab("deadlines"))),
       section("Мои курсы", courseList(overview.courses.slice(0, 3)),
         button("Все курсы", "link-button", () => switchTab("courses"))),
-      button("Связаться с поддержкой", "link-button support-link", () => switchTab("support")));
+      button("Поддержка", "link-button support-link", () => switchTab("support")));
   } else if (tab === "courses") {
     view.replaceChildren(heading("Мои курсы"), courseList(overview.courses));
   } else if (tab === "deadlines") {

@@ -31,8 +31,8 @@ const BTN_DEADLINES = "⏰ Дедлайны";
 const BTN_SAVED = "⭐ Избранное";
 const BTN_SETTINGS = "⚙️ Настройки";
 const BTN_APP = "🎓 Мини-приложение";
-const BTN_SUPPORT = "💬 Связаться с поддержкой";
-const UPLOAD_ACCESS = "Запросить доступ для размещения своих файлов в бота";
+const BTN_SUPPORT = "💬 Поддержка";
+const OLD_BTN_SUPPORT = "💬 Связаться с поддержкой";
 const UPLOAD_PROMPT = "Выберите группы, затем нажмите «Разослать файл».";
 const STUDENT_FILE_PROMPT = "Прикрепите документ ответом на это сообщение. Можно добавить подпись к файлу. После этого выберите группы для рассылки.";
 const STUDENT_GROUP_PROMPT = "Выберите группы, затем нажмите «На проверку». Файл увидит администратор.";
@@ -846,10 +846,16 @@ function isAdmin(catalog, chatId) {
   return !!(catalog.admin && String(catalog.admin).trim() === chatId);
 }
 
-async function supportPrompt(env, chatId, showAccess = true) {
-  if (showAccess) await send(env, chatId, "Можно запросить доступ для публикации файлов своей группы.", {
-    reply_markup: { inline_keyboard: [[{ text: UPLOAD_ACCESS, callback_data: "support_upload" }]] },
+function supportMenu(env, chatId) {
+  return send(env, chatId, "💬 <b>Поддержка</b>\nВыберите действие.", {
+    reply_markup: { inline_keyboard: [
+      [{ text: "Написать в поддержку", callback_data: "support_write" }],
+      [{ text: "Предложить файл для публикации", callback_data: "support_upload" }],
+    ] },
   });
+}
+
+function supportPrompt(env, chatId) {
   return send(env, chatId, SUPPORT_PROMPT, {
     reply_markup: { force_reply: true, input_field_placeholder: "Сообщение для поддержки" },
   });
@@ -873,7 +879,7 @@ async function submitSupport(msg, catalog, env) {
   const text = msg.text?.trim();
   if (!text || text.length > 3500) {
     await send(env, chatId, "Поддержка принимает текст до 3500 символов.");
-    return supportPrompt(env, chatId, false);
+    return supportPrompt(env, chatId);
   }
   const sub = await getSub(env, chatId);
   const ok = await forwardSupport(env, catalog, sub, chatId, msg.message_id, text);
@@ -1081,7 +1087,7 @@ async function handleMessage(msg, catalog, env, origin) {
     if (command === "/upload") return send(env, chatId, "Пришлите документ, затем выберите группы для рассылки. К файлу можно добавить подпись.");
     if (command === "/refresh_keyboard") {
       return broadcastToSubscribers(env, catalog, chatId, null,
-        "Меню бота обновилось. Теперь в нём есть кнопка «Связаться с поддержкой».",
+        "Меню бота обновилось. Теперь в нём есть кнопка «Поддержка».",
         { reply_markup: mainKeyboard(), disable_notification: true });
     }
     if (command === "/support_setup") return setupSupportWebhook(env, chatId, origin);
@@ -1093,8 +1099,8 @@ async function handleMessage(msg, catalog, env, origin) {
       });
     }
   }
-  if (msg.chat.type === "private" && (command === "/support" || text === BTN_SUPPORT)) {
-    return supportPrompt(env, chatId);
+  if (msg.chat.type === "private" && (command === "/support" || text === BTN_SUPPORT || text === OLD_BTN_SUPPORT)) {
+    return supportMenu(env, chatId);
   }
   if (command !== "/start" && msg.chat.type === "private" && replyFromBot(msg, env.TELEGRAM_BOT_TOKEN) === SUPPORT_PROMPT) {
     return submitSupport(msg, catalog, env);
@@ -1186,16 +1192,19 @@ async function handleCallback(cq, catalog, env) {
   const answer = (text) => tg(env, "answerCallbackQuery", { callback_query_id: cq.id, text });
   if (data === "support" && msg?.chat.type === "private") {
     await answer();
-    return supportPrompt(env, String(msg.chat.id));
+    return supportMenu(env, String(msg.chat.id));
+  }
+  if ((data === "support_write" || data === "support_upload") && msg?.chat.type === "private") {
+    await answer();
+    const chatId = String(msg.chat.id);
+    const sent = data === "support_write" ? await supportPrompt(env, chatId) : await requestStudentFile(env, chatId);
+    if (sent.ok) await tg(env, "deleteMessage", { chat_id: chatId, message_id: msg.message_id });
+    return sent;
   }
   if (!catalog || !msg) return answer("Бот ещё настраивается");
 
   const chatId = String(msg.chat.id);
   const sub = await getSub(env, chatId);
-  if (data === "support_upload" && msg.chat.type === "private") {
-    await answer();
-    return requestStudentFile(env, chatId);
-  }
   if (data.startsWith("upload_")) {
     if (msg.chat.type !== "private" || String(cq.from?.id) !== chatId) return answer();
     const source = msg.reply_to_message;
